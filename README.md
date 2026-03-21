@@ -21,8 +21,8 @@
 [Alexandr Hacicheant](mailto:a.hacicheant@gmail.com)
 
 ## Requirements
--	[Terraform](https://www.terraform.io/downloads.html) >=0.13.x
--	[Go](https://golang.org/doc/install) 1.24.x (to build the provider plugin)
+-	[Terraform](https://www.terraform.io/downloads.html) >=0.14.x
+-	[Go](https://golang.org/doc/install) 1.25.x (to build the provider plugin)
 
 ## Building The Provider
 
