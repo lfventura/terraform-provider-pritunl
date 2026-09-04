@@ -17,6 +17,12 @@ on:
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
+    permissions:
+      # goreleaser publishes a GitHub Release and uploads the signed archives
+      # to it; forked repositories default GITHUB_TOKEN to read-only, which
+      # makes that request fail with "403 Resource not accessible by
+      # integration".
+      contents: write
     steps:
       -
         name: Checkout
