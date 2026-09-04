@@ -42,7 +42,7 @@ func resourceSettings() *schema.Resource {
 				Computed:     true,
 				RequiredWith: []string{"server_key"},
 				StateFunc:    trimSpaceStateFunc,
-				Description:  "The PEM encoded certificate served by the web console and the API. It must contain the full chain, the leaf certificate followed by the intermediate certificate(s) concatenated, otherwise Pritunl will not validate and accept it correctly. Destroying the resource hands the certificate back to Pritunl, which regenerates its self-signed default.",
+				Description:  "The certificate served by the web console and the API, as pure concatenated PEM blocks: the leaf certificate followed by the intermediate certificate(s), in that order. The root CA certificate must be left out, clients already trust it through their own trust store and only need the intermediates to build the chain. Nothing but `-----BEGIN CERTIFICATE-----` blocks may be present: the `Bag Attributes`, `subject=` and `issuer=` lines that `openssl pkcs12 -nokeys` writes in front of every block are OpenSSL specific text, not part of the PEM format, and Pritunl rejects a certificate that still carries them. Destroying the resource hands the certificate back to Pritunl, which regenerates its self-signed default.",
 			},
 			"server_key": {
 				Type:         schema.TypeString,
