@@ -1,4 +1,4 @@
-module github.com/disc/terraform-provider-pritunl
+module github.com/lfventura/terraform-provider-pritunl
 
 go 1.25.8
 

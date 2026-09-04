@@ -3,9 +3,9 @@ package main
 import (
 	"context"
 	"flag"
-	"github.com/disc/terraform-provider-pritunl/internal/provider"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/plugin"
+	"github.com/lfventura/terraform-provider-pritunl/internal/provider"
 	"log"
 )
 
@@ -24,7 +24,7 @@ func main() {
 	}
 
 	if debugMode {
-		err := plugin.Debug(context.Background(), "registry.terraform.io/disc/pritunl", opts)
+		err := plugin.Debug(context.Background(), "registry.terraform.io/lfventura/pritunl", opts)
 		if err != nil {
 			log.Fatal(err.Error())
 		}
