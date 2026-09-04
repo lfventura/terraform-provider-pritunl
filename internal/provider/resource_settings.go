@@ -30,7 +30,7 @@ const (
 
 func resourceSettings() *schema.Resource {
 	return &schema.Resource{
-		Description: "The settings resource allows managing the global settings of a Pritunl instance, in particular the TLS certificate served by its own web console and API. It is a singleton resource: a single instance of it maps to the whole Pritunl instance and its import id is always `settings`.",
+		Description: "The settings resource allows managing the global settings of a Pritunl instance, in particular the TLS certificate served by its own web console and API. It is a singleton resource: a single instance of it maps to the whole Pritunl instance and its import id is always `settings`. Every write is a read-modify-write of the complete settings object, the same way the Pritunl web console itself works: `PUT /settings` is a full replace and not a partial update, so the settings are read back from the instance immediately before each write and handed over again with the managed attributes overlaid on top of them. That is what keeps unmanaged settings such as the single sign-on, SMTP or monitoring configuration untouched, and only the managed attributes are ever stored in the Terraform state.",
 		Schema: map[string]*schema.Schema{
 			// the certificate fields are computed so that leaving them out of
 			// the configuration keeps the certificate of the instance as it is
@@ -81,20 +81,15 @@ func trimSpaceStateFunc(value interface{}) string {
 func resourceCreateSettings(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	apiClient := meta.(pritunl.Client)
 
-	// the settings object always exists, there is nothing to create: only the
-	// managed fields are pushed and every other setting is left untouched
-	current, err := apiClient.GetSettings()
+	// the settings object always exists, there is nothing to create: the whole
+	// object is read, the managed attributes are overlaid on it and all of it
+	// is written back
+	settings, err := apiClient.GetSettings()
 	if err != nil {
 		return diag.FromErr(err)
 	}
 
-	settings := settingsPayload(d, current)
-
-	portChanged := false
-	if v, ok := d.GetOk("server_port"); ok {
-		settings.ServerPort = v.(int)
-		portChanged = settings.ServerPort != current.ServerPort
-	}
+	portChanged := overlaySettings(d, settings)
 
 	if err = apiClient.UpdateSettings(settings); err != nil {
 		return diag.FromErr(err)
@@ -114,8 +109,10 @@ func resourceReadSettings(ctx context.Context, d *schema.ResourceData, meta inte
 		return diag.FromErr(err)
 	}
 
-	d.Set("server_cert", derefString(settings.ServerCert))
-	d.Set("server_port", settings.ServerPort)
+	// only the managed attributes make it into the state, the rest of the
+	// settings object is a write time detail and never leaves this package
+	d.Set("server_cert", strings.TrimSpace(settings.String("server_cert")))
+	d.Set("server_port", settings.Int("server_port"))
 
 	// GET /settings does return server_key in plain text, but it is deliberately
 	// not stored: it would copy the private key of the instance into the state
@@ -129,22 +126,16 @@ func resourceReadSettings(ctx context.Context, d *schema.ResourceData, meta inte
 func resourceUpdateSettings(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	apiClient := meta.(pritunl.Client)
 
-	portChanged := d.HasChange("server_port")
-
-	if !portChanged && !d.HasChange("server_cert") && !d.HasChange("server_key") {
+	if !d.HasChange("server_port") && !d.HasChange("server_cert") && !d.HasChange("server_key") {
 		return resourceReadSettings(ctx, d, meta)
 	}
 
-	current, err := apiClient.GetSettings()
+	settings, err := apiClient.GetSettings()
 	if err != nil {
 		return diag.FromErr(err)
 	}
 
-	settings := settingsPayload(d, current)
-
-	if v, ok := d.GetOk("server_port"); ok {
-		settings.ServerPort = v.(int)
-	}
+	portChanged := overlaySettings(d, settings)
 
 	if err = apiClient.UpdateSettings(settings); err != nil {
 		return diag.FromErr(err)
@@ -153,30 +144,38 @@ func resourceUpdateSettings(ctx context.Context, d *schema.ResourceData, meta in
 	return finishSettingsWrite(ctx, d, meta, portChanged)
 }
 
-// Pritunl regenerates a self-signed certificate whenever it restarts its web
-// server for a settings write that did not carry server_cert and server_key, so
-// the pair is part of every payload, even when only the port changes. The
-// configured pair is used when this resource manages one, otherwise the pair
-// already installed on the instance is sent back untouched. Both always travel
-// together: a key without its certificate would leave Pritunl unable to serve
-// HTTPS at all.
-func settingsPayload(d *schema.ResourceData, current *pritunl.Settings) *pritunl.Settings {
-	settings := &pritunl.Settings{}
-
+// overlaySettings writes the attributes managed by this resource on top of the
+// settings object that was just read from the instance, and reports whether the
+// web server is about to move to another port.
+//
+// Everything it does not touch is left in the object exactly as the API
+// returned it, which is what the surrounding full object round trip hands back.
+// That includes the settings the API computes rather than stores, such as
+// public_address, which falls back to the address Pritunl detected on its own:
+// echoing back a value that was just read is a no-op, echoing back a stale one
+// would pin it as a manual override, so the settings are always read as part of
+// the write and never cached between runs.
+func overlaySettings(d *schema.ResourceData, settings pritunl.Settings) bool {
 	cert := strings.TrimSpace(d.Get("server_cert").(string))
 	key := strings.TrimSpace(d.Get("server_key").(string))
 
-	if cert == "" || key == "" {
-		cert = strings.TrimSpace(derefString(current.ServerCert))
-		key = strings.TrimSpace(derefString(current.ServerKey))
-	}
-
+	// the pair is only pushed when this resource manages one: the certificate
+	// already installed on the instance is otherwise handed back untouched.
+	// Both always travel together, a key without its certificate would leave
+	// Pritunl unable to serve HTTPS at all.
 	if cert != "" && key != "" {
-		settings.ServerCert = &cert
-		settings.ServerKey = &key
+		settings["server_cert"] = cert
+		settings["server_key"] = key
 	}
 
-	return settings
+	portChanged := false
+
+	if port, ok := d.GetOk("server_port"); ok {
+		portChanged = port.(int) != settings.Int("server_port")
+		settings["server_port"] = port.(int)
+	}
+
+	return portChanged
 }
 
 func resourceDeleteSettings(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
@@ -191,22 +190,24 @@ func resourceDeleteSettings(ctx context.Context, d *schema.ResourceData, meta in
 		return nil
 	}
 
-	// the settings object cannot be deleted, destroying the resource resets the
-	// managed certificate instead. An empty string is enough to clear it: the
-	// API turns any falsy value into null, and Pritunl then regenerates its
-	// self-signed default while restarting the web server. server_port is left
-	// alone, the instance still has to be reachable on the same port.
-	empty := ""
-	settings := &pritunl.Settings{
-		ServerCert: &empty,
-		ServerKey:  &empty,
-	}
-
-	if err := apiClient.UpdateSettings(settings); err != nil {
+	settings, err := apiClient.GetSettings()
+	if err != nil {
 		return diag.FromErr(err)
 	}
 
-	if err := waitForWebServer(ctx, apiClient); err != nil {
+	// the settings object cannot be deleted, destroying the resource resets the
+	// managed certificate instead. An empty string is enough to clear it:
+	// Pritunl turns any falsy certificate into null and then regenerates its
+	// self-signed default while restarting the web server. Every other setting,
+	// server_port included, is handed back untouched by the round trip.
+	settings["server_cert"] = ""
+	settings["server_key"] = ""
+
+	if err = apiClient.UpdateSettings(settings); err != nil {
+		return diag.FromErr(err)
+	}
+
+	if err = waitForWebServer(ctx, apiClient); err != nil {
 		return diag.FromErr(err)
 	}
 
@@ -284,12 +285,4 @@ func sleepContext(ctx context.Context, duration time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
-}
-
-func derefString(value *string) string {
-	if value == nil {
-		return ""
-	}
-
-	return *value
 }

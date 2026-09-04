@@ -1,3 +1,10 @@
+# The resource always writes the complete settings object back: it reads the
+# settings of the instance immediately before each write and overlays only the
+# attributes below on top of them, the same way the Pritunl web console does.
+# `PUT /settings` is a full replace and not a partial update, so applying this
+# resource leaves the single sign-on, SMTP, monitoring and every other unmanaged
+# setting of the instance untouched.
+
 # Rotating the TLS certificate served by the Pritunl web console and API from a
 # certificate stored in Azure Key Vault.
 #
@@ -45,3 +52,14 @@ resource "pritunl_settings" "main" {
 #   openssl pkcs12 -in vpn.pfx -nokeys -legacy |
 #     sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' |
 #     awk '/BEGIN CERTIFICATE/ { n++ } n <= 2' > server_cert.pem
+
+# Managing only the port, on an instance whose certificate is handled elsewhere.
+# The certificate already installed is read back and handed over untouched, so
+# this never takes ownership of it:
+#
+#   resource "pritunl_settings" "port_only" {
+#     server_port = 8443
+#   }
+#
+# Changing the port makes Pritunl restart its web server on the new one, so the
+# `url` of the provider has to be updated before the next run.

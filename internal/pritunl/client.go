@@ -47,8 +47,8 @@ type Client interface {
 	StartServer(serverId string) error
 	StopServer(serverId string) error
 
-	GetSettings() (*Settings, error)
-	UpdateSettings(settings *Settings) error
+	GetSettings() (Settings, error)
+	UpdateSettings(settings Settings) error
 }
 
 type client struct {
@@ -860,7 +860,7 @@ func (c client) DetachHostFromServer(hostId, serverId string) error {
 	return nil
 }
 
-func (c client) GetSettings() (*Settings, error) {
+func (c client) GetSettings() (Settings, error) {
 	url := "/settings"
 	req, err := http.NewRequest("GET", url, nil)
 
@@ -875,19 +875,30 @@ func (c client) GetSettings() (*Settings, error) {
 		return nil, fmt.Errorf("Non-200 response on getting the settings\ncode=%d", resp.StatusCode)
 	}
 
-	var settings Settings
+	settings := Settings{}
 
-	// a successful response carries the web server private key, so neither the
-	// body nor the parsed struct are reported back on failure
-	err = json.Unmarshal(body, &settings)
+	// a successful response carries the web server private key along with every
+	// other secret of the instance, so neither the body nor the parsed object
+	// are reported back on failure. Numbers are decoded as json.Number so that
+	// the settings handed back to the API keep the representation it returned.
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+
+	err = decoder.Decode(&settings)
 	if err != nil {
 		return nil, fmt.Errorf("GetSettings: Error on unmarshalling response: %s", err)
 	}
 
-	return &settings, nil
+	return settings, nil
 }
 
-func (c client) UpdateSettings(settings *Settings) error {
+// UpdateSettings replaces the whole settings object of the instance. PUT
+// /settings is a full replace, so the settings handed over here have to be the
+// complete object read from GetSettings with the wanted changes applied on top
+// of it, otherwise every setting missing from the body is cleared.
+func (c client) UpdateSettings(settings Settings) error {
+	settings.normalize()
+
 	jsonData, err := json.Marshal(settings)
 	if err != nil {
 		return fmt.Errorf("UpdateSettings: Error on marshalling data: %s", err)
@@ -904,7 +915,9 @@ func (c client) UpdateSettings(settings *Settings) error {
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("Non-200 response on updating the settings\nbody=%s", body)
+		// a body the web server could not deserialise is answered with an empty
+		// 400, so the status code is reported next to it
+		return fmt.Errorf("Non-200 response on updating the settings\ncode=%d\nbody=%s", resp.StatusCode, body)
 	}
 
 	return nil

@@ -72,10 +72,7 @@ func TestAccPritunlSettings(t *testing.T) {
 			t.Fatalf("failed to read the settings of the test instance: %s", err)
 		}
 
-		certificate := ""
-		if settings.ServerCert != nil {
-			certificate = strings.TrimSpace(*settings.ServerCert)
-		}
+		certificate := strings.TrimSpace(settings.String("server_cert"))
 
 		resource.Test(t, resource.TestCase{
 			PreCheck:          func() { preCheck(t) },
@@ -84,9 +81,9 @@ func TestAccPritunlSettings(t *testing.T) {
 			Steps: []resource.TestStep{
 				{
 					// the port already in use, so the web server is left alone
-					Config: testPritunlSettingsPortConfig(settings.ServerPort),
+					Config: testPritunlSettingsPortConfig(settings.Int("server_port")),
 					Check: resource.ComposeTestCheckFunc(
-						resource.TestCheckResourceAttr("pritunl_settings.test", "server_port", strconv.Itoa(settings.ServerPort)),
+						resource.TestCheckResourceAttr("pritunl_settings.test", "server_port", strconv.Itoa(settings.Int("server_port"))),
 						// the private key is never read back, so managing only
 						// the port leaves it out of the state entirely
 						resource.TestCheckNoResourceAttr("pritunl_settings.test", "server_key"),
@@ -96,6 +93,126 @@ func TestAccPritunlSettings(t *testing.T) {
 			},
 		})
 	})
+
+	// The reason the resource writes the complete settings object back: a
+	// Terraform run that only manages the port must leave every other setting
+	// of the instance alone. A few unrelated settings are configured out of
+	// band, the way an operator would from the web console, and have to still
+	// be there once Terraform has written the settings it manages.
+	t.Run("leaves unrelated settings untouched", func(t *testing.T) {
+		if os.Getenv("TF_ACC") == "" {
+			t.Skip("TF_ACC is not set, skipping the acceptance test")
+		}
+
+		expected := configureUnrelatedSettings(t)
+
+		settings, err := testClient.GetSettings()
+		if err != nil {
+			t.Fatalf("failed to read the settings of the test instance: %s", err)
+		}
+
+		resource.Test(t, resource.TestCase{
+			PreCheck:          func() { preCheck(t) },
+			ProviderFactories: providerFactories,
+			CheckDestroy:      testAccCheckUnrelatedSettings(expected),
+			Steps: []resource.TestStep{
+				{
+					// the port already in use, so the web server is left alone
+					Config: testPritunlSettingsPortConfig(settings.Int("server_port")),
+					Check: resource.ComposeTestCheckFunc(
+						resource.TestCheckResourceAttr("pritunl_settings.test", "id", "settings"),
+						testAccCheckUnrelatedSettings(expected),
+					),
+				},
+			},
+		})
+	})
+}
+
+// Settings this provider does not manage, used to prove that writing the
+// managed ones hands everything else back untouched. They are deliberately not
+// sso_* settings: Pritunl clears all of those on any write while single sign-on
+// itself is disabled, which would fail the check for a reason that has nothing
+// to do with this provider.
+var unrelatedSettings = map[string]interface{}{
+	"restrict_import": true,
+	"email_server":    "smtp.unrelated.example.com",
+	"email_from":      "unrelated@example.com",
+	"pin_mode":        "optional",
+}
+
+// configureUnrelatedSettings applies the unrelated settings through a full
+// object write, restores the previous values once the test is over and returns
+// the values the API reports for them, so that the checks compare against what
+// Pritunl actually stored rather than against what was sent.
+func configureUnrelatedSettings(t *testing.T) map[string]interface{} {
+	t.Helper()
+
+	settings, err := testClient.GetSettings()
+	if err != nil {
+		t.Fatalf("failed to read the settings of the test instance: %s", err)
+	}
+
+	previous := make(map[string]interface{}, len(unrelatedSettings))
+	for key := range unrelatedSettings {
+		previous[key] = settings[key]
+	}
+
+	for key, value := range unrelatedSettings {
+		settings[key] = value
+	}
+
+	if err = testClient.UpdateSettings(settings); err != nil {
+		t.Fatalf("failed to configure the unrelated settings: %s", err)
+	}
+
+	t.Cleanup(func() {
+		current, err := testClient.GetSettings()
+		if err != nil {
+			return
+		}
+
+		for key, value := range previous {
+			current[key] = value
+		}
+
+		testClient.UpdateSettings(current)
+	})
+
+	settings, err = testClient.GetSettings()
+	if err != nil {
+		t.Fatalf("failed to read the settings of the test instance: %s", err)
+	}
+
+	expected := make(map[string]interface{}, len(unrelatedSettings))
+	for key := range unrelatedSettings {
+		expected[key] = settings[key]
+
+		if fmt.Sprintf("%v", settings[key]) != fmt.Sprintf("%v", unrelatedSettings[key]) {
+			t.Fatalf("the unrelated setting %q has not been configured: got %v, want %v",
+				key, settings[key], unrelatedSettings[key])
+		}
+	}
+
+	return expected
+}
+
+func testAccCheckUnrelatedSettings(expected map[string]interface{}) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		settings, err := testClient.GetSettings()
+		if err != nil {
+			return err
+		}
+
+		for key, value := range expected {
+			if fmt.Sprintf("%v", settings[key]) != fmt.Sprintf("%v", value) {
+				return fmt.Errorf("the unmanaged setting %q has been modified: got %v, want %v",
+					key, settings[key], value)
+			}
+		}
+
+		return nil
+	}
 }
 
 func testPritunlSettingsPortConfig(port int) string {
@@ -113,7 +230,7 @@ func testAccCheckSettingsCertificateKept(certificate string) resource.TestCheckF
 			return err
 		}
 
-		if settings.ServerCert == nil || strings.TrimSpace(*settings.ServerCert) != certificate {
+		if strings.TrimSpace(settings.String("server_cert")) != certificate {
 			return fmt.Errorf("the certificate of the pritunl instance has been modified")
 		}
 
@@ -137,7 +254,7 @@ func testAccCheckSettingsCertificate(cert string) resource.TestCheckFunc {
 			return err
 		}
 
-		if settings.ServerCert == nil || strings.TrimSpace(*settings.ServerCert) != cert {
+		if strings.TrimSpace(settings.String("server_cert")) != cert {
 			return fmt.Errorf("the certificate has not been applied on the pritunl instance")
 		}
 
@@ -154,11 +271,11 @@ func testAccCheckSettingsCertificateReset(cert string) resource.TestCheckFunc {
 			return err
 		}
 
-		if settings.ServerCert == nil || strings.TrimSpace(*settings.ServerCert) == "" {
+		if strings.TrimSpace(settings.String("server_cert")) == "" {
 			return fmt.Errorf("the pritunl instance has been left without a certificate")
 		}
 
-		if strings.TrimSpace(*settings.ServerCert) == cert {
+		if strings.TrimSpace(settings.String("server_cert")) == cert {
 			return fmt.Errorf("the certificate is still applied on the pritunl instance")
 		}
 
