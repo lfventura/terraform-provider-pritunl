@@ -49,7 +49,6 @@ type Client interface {
 
 	GetSettings() (*Settings, error)
 	UpdateSettings(settings *Settings) error
-	ResetCertificate() error
 }
 
 type client struct {
@@ -906,34 +905,6 @@ func (c client) UpdateSettings(settings *Settings) error {
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("Non-200 response on updating the settings\nbody=%s", body)
-	}
-
-	return nil
-}
-
-// ResetCertificate hands the web server certificate back to Pritunl, which
-// regenerates its self-signed default. The API only resets a field when its key
-// is present in the body with a literal JSON null, and the omitempty tags of the
-// Settings struct would drop the nil pointers from the payload instead of
-// serialising them as null, hence the dedicated struct without omitempty.
-func (c client) ResetCertificate() error {
-	jsonData, err := json.Marshal(resetCertificateSettings{ServerCert: nil, ServerKey: nil})
-	if err != nil {
-		return fmt.Errorf("ResetCertificate: Error on marshalling data: %s", err)
-	}
-
-	url := "/settings"
-	req, err := http.NewRequest("PUT", url, bytes.NewBuffer(jsonData))
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("ResetCertificate: Error on HTTP request: %s", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("Non-200 response on resetting the settings certificate\nbody=%s", body)
 	}
 
 	return nil

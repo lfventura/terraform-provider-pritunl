@@ -192,10 +192,17 @@ func resourceDeleteSettings(ctx context.Context, d *schema.ResourceData, meta in
 	}
 
 	// the settings object cannot be deleted, destroying the resource resets the
-	// managed certificate instead: Pritunl regenerates its self-signed default
-	// and restarts the web server. server_port is left alone, the instance
-	// still has to be reachable on the same port.
-	if err := apiClient.ResetCertificate(); err != nil {
+	// managed certificate instead. An empty string is enough to clear it: the
+	// API turns any falsy value into null, and Pritunl then regenerates its
+	// self-signed default while restarting the web server. server_port is left
+	// alone, the instance still has to be reachable on the same port.
+	empty := ""
+	settings := &pritunl.Settings{
+		ServerCert: &empty,
+		ServerKey:  &empty,
+	}
+
+	if err := apiClient.UpdateSettings(settings); err != nil {
 		return diag.FromErr(err)
 	}
 
