@@ -2,10 +2,10 @@ package provider
 
 import (
 	"fmt"
-	"github.com/disc/terraform-provider-pritunl/internal/pritunl"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	"github.com/lfventura/terraform-provider-pritunl/internal/pritunl"
 	"os"
 	"strconv"
 	"testing"
