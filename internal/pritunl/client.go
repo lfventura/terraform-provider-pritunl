@@ -46,6 +46,10 @@ type Client interface {
 
 	StartServer(serverId string) error
 	StopServer(serverId string) error
+
+	GetSettings() (*Settings, error)
+	UpdateSettings(settings *Settings) error
+	ResetCertificate() error
 }
 
 type client struct {
@@ -852,6 +856,84 @@ func (c client) DetachHostFromServer(hostId, serverId string) error {
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("Non-200 response on detaching the host from the server\nbody=%s", body)
+	}
+
+	return nil
+}
+
+func (c client) GetSettings() (*Settings, error) {
+	url := "/settings"
+	req, err := http.NewRequest("GET", url, nil)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("GetSettings: Error on HTTP request: %s", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("Non-200 response on getting the settings\ncode=%d", resp.StatusCode)
+	}
+
+	var settings Settings
+
+	// a successful response carries the web server private key, so neither the
+	// body nor the parsed struct are reported back on failure
+	err = json.Unmarshal(body, &settings)
+	if err != nil {
+		return nil, fmt.Errorf("GetSettings: Error on unmarshalling response: %s", err)
+	}
+
+	return &settings, nil
+}
+
+func (c client) UpdateSettings(settings *Settings) error {
+	jsonData, err := json.Marshal(settings)
+	if err != nil {
+		return fmt.Errorf("UpdateSettings: Error on marshalling data: %s", err)
+	}
+
+	url := "/settings"
+	req, err := http.NewRequest("PUT", url, bytes.NewBuffer(jsonData))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("UpdateSettings: Error on HTTP request: %s", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("Non-200 response on updating the settings\nbody=%s", body)
+	}
+
+	return nil
+}
+
+// ResetCertificate hands the web server certificate back to Pritunl, which
+// regenerates its self-signed default. The API only resets a field when its key
+// is present in the body with a literal JSON null, and the omitempty tags of the
+// Settings struct would drop the nil pointers from the payload instead of
+// serialising them as null, hence the dedicated struct without omitempty.
+func (c client) ResetCertificate() error {
+	jsonData, err := json.Marshal(resetCertificateSettings{ServerCert: nil, ServerKey: nil})
+	if err != nil {
+		return fmt.Errorf("ResetCertificate: Error on marshalling data: %s", err)
+	}
+
+	url := "/settings"
+	req, err := http.NewRequest("PUT", url, bytes.NewBuffer(jsonData))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("ResetCertificate: Error on HTTP request: %s", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("Non-200 response on resetting the settings certificate\nbody=%s", body)
 	}
 
 	return nil
