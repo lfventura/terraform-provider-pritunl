@@ -29,7 +29,7 @@ type User struct {
 	OtpAuth         bool                     `json:"otp_auth,omitempty"`
 	DeviceAuth      bool                     `json:"device_auth,omitempty"`
 	Organization    string                   `json:"organization,omitempty"`
-	Pin             *Pin                      `json:"pin,omitempty"`
+	Pin             *Pin                     `json:"pin,omitempty"`
 }
 
 type PortForwarding struct {

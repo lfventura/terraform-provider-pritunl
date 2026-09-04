@@ -941,7 +941,7 @@ func (c client) ResetCertificate() error {
 
 func NewClient(baseUrl, apiToken, apiSecret string, insecure bool) Client {
 	underlyingTransport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+		Proxy:           http.ProxyFromEnvironment,
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure},
 	}
 	httpClient := &http.Client{
