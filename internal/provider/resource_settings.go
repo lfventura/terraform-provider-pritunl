@@ -102,7 +102,7 @@ func resourceSettings() *schema.Resource {
 				Computed:     true,
 				RequiredWith: []string{"sso"},
 				StateFunc:    normalizeSAMLCertStateFunc,
-				Description:  "The X.509 certificate the identity provider signs its SAML assertions with. It is a single certificate of the identity provider and not a chain, so unlike `server_cert` there are no intermediates to concatenate and no leaf to put first. Pritunl neither parses nor validates it and its SAML service only works with an armored certificate, so the value is canonicalised into PEM before anything compares or writes it: naked base64, the form Okta's SAML metadata carries in its `X509Certificate` element, is stripped of whitespace, wrapped at 64 columns and armored, while an already armored value only loses its surrounding whitespace.",
+				Description:  "The X.509 certificate the identity provider signs its SAML assertions with. It is a single certificate of the identity provider and not a chain, so unlike `server_cert` there are no intermediates to concatenate and no leaf to put first. Pritunl accepts and stores whatever string it is handed but its SAML service only works with an armored certificate, so the configured value is canonicalised into PEM on the way in: naked base64, the form Okta's SAML metadata carries in its `X509Certificate` element, is stripped of whitespace, wrapped at 64 columns and armored, while an already armored value only loses its surrounding whitespace. The read reports the value the instance really holds, so an instance still carrying a naked, unusable certificate shows as a drift and converges on the next apply.",
 			},
 			"sso_okta_app_id": {
 				Type:         schema.TypeString,
@@ -234,9 +234,10 @@ func trimSpaceStateFunc(value interface{}) string {
 // whitespace, wrapped at 64 columns and armored; a value that already carries
 // one only has its surrounding whitespace trimmed, the way Pritunl stores it,
 // and the empty string stays empty so the attribute keeps its keep-as-is
-// semantics. The read passes through here too, which keeps the comparison
-// canonical on both sides and converges an instance still holding a naked
-// certificate.
+// semantics. Only the configured value goes through here (StateFunc): the
+// read keeps the instance's own value, so an instance holding a naked,
+// unusable certificate surfaces as drift and converges instead of being
+// masked by the normalisation.
 func normalizeSAMLCert(value string) string {
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" || strings.Contains(trimmed, "-----BEGIN") {
@@ -418,7 +419,12 @@ func resourceReadSettings(ctx context.Context, d *schema.ResourceData, meta inte
 	d.Set("sso_org", settings.String("sso_org"))
 	d.Set("sso_saml_url", settings.String("sso_saml_url"))
 	d.Set("sso_saml_issuer_url", settings.String("sso_saml_issuer_url"))
-	d.Set("sso_saml_cert", normalizeSAMLCert(settings.String("sso_saml_cert")))
+	// Deliberately NOT normalised: the read reports what the instance really
+	// holds, so an instance still carrying a naked certificate — which its
+	// SAML service cannot use — shows as a drift from the canonical
+	// configuration and converges on the next apply. Normalising here would
+	// make the broken value compare equal and never be repaired.
+	d.Set("sso_saml_cert", strings.TrimSpace(settings.String("sso_saml_cert")))
 	d.Set("sso_okta_app_id", settings.String("sso_okta_app_id"))
 	d.Set("sso_okta_mode", settings.String("sso_okta_mode"))
 	d.Set("server_sso_url", settings.String("server_sso_url"))
