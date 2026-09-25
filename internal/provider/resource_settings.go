@@ -101,8 +101,8 @@ func resourceSettings() *schema.Resource {
 				Optional:     true,
 				Computed:     true,
 				RequiredWith: []string{"sso"},
-				StateFunc:    trimSpaceStateFunc,
-				Description:  "The X.509 certificate the identity provider signs its SAML assertions with, as the Okta application hands it out. It is a single certificate of the identity provider and not a chain, so unlike `server_cert` there are no intermediates to concatenate and no leaf to put first. Pritunl neither parses nor validates it, it strips the surrounding whitespace and hands it over to its SAML service as it is.",
+				StateFunc:    normalizeSAMLCertStateFunc,
+				Description:  "The X.509 certificate the identity provider signs its SAML assertions with. It is a single certificate of the identity provider and not a chain, so unlike `server_cert` there are no intermediates to concatenate and no leaf to put first. Pritunl neither parses nor validates it and its SAML service only works with an armored certificate, so the value is canonicalised into PEM before anything compares or writes it: naked base64, the form Okta's SAML metadata carries in its `X509Certificate` element, is stripped of whitespace, wrapped at 64 columns and armored, while an already armored value only loses its surrounding whitespace.",
 			},
 			"sso_okta_app_id": {
 				Type:         schema.TypeString,
@@ -225,6 +225,41 @@ func customizeSettingsDiff(ctx context.Context, d *schema.ResourceDiff, meta int
 // with what the API returns.
 func trimSpaceStateFunc(value interface{}) string {
 	return strings.TrimSpace(value.(string))
+}
+
+// normalizeSAMLCert canonicalises the identity provider's signing certificate
+// into armored PEM. Okta's SAML metadata carries the naked base64 of its
+// X509Certificate element while Pritunl's SAML service only works with an
+// armored certificate, so a value without an armor block is stripped of all
+// whitespace, wrapped at 64 columns and armored; a value that already carries
+// one only has its surrounding whitespace trimmed, the way Pritunl stores it,
+// and the empty string stays empty so the attribute keeps its keep-as-is
+// semantics. The read passes through here too, which keeps the comparison
+// canonical on both sides and converges an instance still holding a naked
+// certificate.
+func normalizeSAMLCert(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || strings.Contains(trimmed, "-----BEGIN") {
+		return trimmed
+	}
+
+	compact := strings.Join(strings.Fields(trimmed), "")
+
+	var pem strings.Builder
+	pem.WriteString("-----BEGIN CERTIFICATE-----\n")
+	for len(compact) > 64 {
+		pem.WriteString(compact[:64])
+		pem.WriteByte('\n')
+		compact = compact[64:]
+	}
+	pem.WriteString(compact)
+	pem.WriteString("\n-----END CERTIFICATE-----")
+
+	return pem.String()
+}
+
+func normalizeSAMLCertStateFunc(value interface{}) string {
+	return normalizeSAMLCert(value.(string))
 }
 
 // The boolean settings the resource manages. They share the overlay and the
@@ -383,7 +418,7 @@ func resourceReadSettings(ctx context.Context, d *schema.ResourceData, meta inte
 	d.Set("sso_org", settings.String("sso_org"))
 	d.Set("sso_saml_url", settings.String("sso_saml_url"))
 	d.Set("sso_saml_issuer_url", settings.String("sso_saml_issuer_url"))
-	d.Set("sso_saml_cert", strings.TrimSpace(settings.String("sso_saml_cert")))
+	d.Set("sso_saml_cert", normalizeSAMLCert(settings.String("sso_saml_cert")))
 	d.Set("sso_okta_app_id", settings.String("sso_okta_app_id"))
 	d.Set("sso_okta_mode", settings.String("sso_okta_mode"))
 	d.Set("server_sso_url", settings.String("server_sso_url"))
