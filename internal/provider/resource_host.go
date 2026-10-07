@@ -12,17 +12,17 @@ import (
 
 func resourceHost() *schema.Resource {
 	return &schema.Resource{
-		Description: "The host resource manages the settings of a Pritunl host. " +
+		Description: "The host resource manages the settings of a Pritunl instance's host. " +
 			"Hosts are born when the pritunl agent registers, never created by Terraform: " +
-			"this resource adopts the host by its hostname and manages its settings " +
-			"(the display name and the public address clients connect to). Destroying " +
-			"the resource only forgets it — the host itself is never removed.",
+			"this resource adopts the instance's single host and manages its settings " +
+			"(the display name and the public address clients connect to). An instance " +
+			"running more than one host is not supported and fails naming them. " +
+			"Destroying the resource only forgets it — the host itself is never removed.",
 		Schema: map[string]*schema.Schema{
 			"hostname": {
 				Type:        schema.TypeString,
-				Required:    true,
-				ForceNew:    true,
-				Description: "The machine hostname the host registered with; the adoption key.",
+				Computed:    true,
+				Description: "The machine hostname the adopted host registered with.",
 			},
 			"name": {
 				Type:        schema.TypeString,
@@ -55,17 +55,20 @@ func resourceCreateHost(ctx context.Context, d *schema.ResourceData, meta interf
 		return diag.FromErr(err)
 	}
 
-	hostname := d.Get("hostname").(string)
-	available := make([]string, 0, len(hosts))
-	for _, host := range hosts {
-		if host.Hostname == hostname {
-			d.SetId(host.ID)
-			return writeHostSettings(ctx, d, meta)
+	if len(hosts) == 0 {
+		return diag.Errorf("no host is registered on the instance")
+	}
+	if len(hosts) > 1 {
+		hostnames := make([]string, 0, len(hosts))
+		for _, host := range hosts {
+			hostnames = append(hostnames, host.Hostname)
 		}
-		available = append(available, host.Hostname)
+		return diag.Errorf("the instance runs %d hosts (%s); this resource manages single-host instances only", len(hosts), strings.Join(hostnames, ", "))
 	}
 
-	return diag.Errorf("no host registered with hostname %q; the instance knows: %s", hostname, strings.Join(available, ", "))
+	d.SetId(hosts[0].ID)
+
+	return writeHostSettings(ctx, d, meta)
 }
 
 func resourceUpdateHost(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
