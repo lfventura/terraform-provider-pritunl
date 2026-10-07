@@ -746,9 +746,18 @@ func resourceCreateServer(ctx context.Context, d *schema.ResourceData, meta inte
 			routes = append(routes, pritunl.ConvertMapToRoute(v.(map[string]interface{})))
 		}
 
+		if err := validateDefaultRoutePair(routes); err != nil {
+			return diag.FromErr(err)
+		}
+
 		err = apiClient.AddRoutesToServer(d.Id(), routes)
 		if err != nil {
 			return diag.Errorf("Error on attaching route from the server: %s", err)
+		}
+
+		err = reconcileServerRoutes(apiClient, d.Id(), routes)
+		if err != nil {
+			return diag.Errorf("Error on reconciling routes on the server: %s", err)
 		}
 	}
 
@@ -1014,6 +1023,27 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 			oldRoutesMap[route.Network] = route
 		}
 
+		declaredRoutes := make([]pritunl.Route, 0, len(newRoutesMap))
+		for _, route := range newRoutesMap {
+			declaredRoutes = append(declaredRoutes, route)
+		}
+		if err := validateDefaultRoutePair(declaredRoutes); err != nil {
+			return diag.FromErr(err)
+		}
+
+		// Deletions run first: Pritunl cascades some of them (removing
+		// 0.0.0.0/0 also removes its ::/0 companion), so a route added or
+		// updated before a cascading delete would be lost.
+		for network, oldRoute := range oldRoutesMap {
+			if _, found := newRoutesMap[network]; !found {
+				// delete route
+				err = apiClient.DeleteRouteFromServer(d.Id(), oldRoute)
+				if err != nil {
+					return diag.Errorf("Error on deleting route from the server: %s", err)
+				}
+			}
+		}
+
 		for network, newRoute := range newRoutesMap {
 			if oldRoute, found := oldRoutesMap[network]; found {
 				// update if something changed or skip
@@ -1032,14 +1062,9 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 			}
 		}
 
-		for network, oldRoute := range oldRoutesMap {
-			if _, found := newRoutesMap[network]; !found {
-				// delete route
-				err = apiClient.DeleteRouteFromServer(d.Id(), oldRoute)
-				if err != nil {
-					return diag.Errorf("Error on deleting route from the server: %s", err)
-				}
-			}
+		err = reconcileServerRoutes(apiClient, d.Id(), declaredRoutes)
+		if err != nil {
+			return diag.Errorf("Error on reconciling routes on the server: %s", err)
 		}
 	}
 
@@ -1109,6 +1134,62 @@ func diffStringLists(mainList []interface{}, otherList []interface{}) []string {
 	}
 
 	return result
+}
+
+// validateDefaultRoutePair rejects the one route shape Pritunl cannot hold:
+// the server couples ::/0 to 0.0.0.0/0 (deleting or creating one acts on
+// the other), so an IPv6 default without the IPv4 default thrashes forever.
+func validateDefaultRoutePair(routes []pritunl.Route) error {
+	hasV4, hasV6 := false, false
+	for _, route := range routes {
+		switch route.Network {
+		case "0.0.0.0/0":
+			hasV4 = true
+		case "::/0":
+			hasV6 = true
+		}
+	}
+	if hasV6 && !hasV4 {
+		return fmt.Errorf("Pritunl couples the default routes: declaring ::/0 requires declaring 0.0.0.0/0 as well")
+	}
+	return nil
+}
+
+// reconcileServerRoutes re-reads the live route table and converges it onto
+// the declared set. Pritunl acts on routes beyond the request that touched
+// them: deleting 0.0.0.0/0 also deletes its ::/0 companion, and routes the
+// server seeds itself carry Pritunl's own flag defaults — so right after the
+// CRUD calls a declared route can be missing or hold different attributes.
+func reconcileServerRoutes(apiClient pritunl.Client, serverId string, declared []pritunl.Route) error {
+	liveRoutes, err := apiClient.GetRoutesByServer(serverId)
+	if err != nil {
+		return fmt.Errorf("reading the routes back: %w", err)
+	}
+
+	liveMap := make(map[string]pritunl.Route)
+	for _, route := range liveRoutes {
+		if route.VirtualNetwork {
+			continue
+		}
+		liveMap[route.Network] = route
+	}
+
+	for _, want := range declared {
+		live, found := liveMap[want.Network]
+		if !found {
+			if err := apiClient.AddRouteToServer(serverId, want); err != nil {
+				return fmt.Errorf("re-adding route %s: %w", want.Network, err)
+			}
+			continue
+		}
+		if live.Nat != want.Nat || live.NetGateway != want.NetGateway || live.Comment != want.Comment {
+			if err := apiClient.UpdateRouteOnServer(serverId, want); err != nil {
+				return fmt.Errorf("converging route %s: %w", want.Network, err)
+			}
+		}
+	}
+
+	return nil
 }
 
 func flattenRoutesData(routesList []pritunl.Route) []interface{} {

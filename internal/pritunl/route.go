@@ -12,7 +12,7 @@ type Route struct {
 	WgNetwork      string `json:"wg_network,omitempty"`
 	NetworkLink    bool   `json:"network_link,omitempty"`
 	ServerLink     bool   `json:"server_link,omitempty"`
-	NetGateway     bool   `json:"net_gateway,omitempty"`
+	NetGateway     bool   `json:"net_gateway"`
 	VpcID          string `json:"vpc_id,omitempty"`
 	VpcRegion      string `json:"vpc_region,omitempty"`
 	Metric         string `json:"metric,omitempty"`

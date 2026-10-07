@@ -680,6 +680,13 @@ func (c client) DeleteRouteFromServer(serverId string, route Route) error {
 	}
 	defer resp.Body.Close()
 
+	// Pritunl couples the default routes: deleting 0.0.0.0/0 removes its
+	// ::/0 companion too, so the companion's own delete finds nothing.
+	// A route already gone is a delete that succeeded.
+	if resp.StatusCode == 404 {
+		return nil
+	}
+
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("Non-200 response on deleting a route on the server\nbody=%s", body)
