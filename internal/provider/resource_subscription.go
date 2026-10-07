@@ -24,7 +24,7 @@ func resourceSubscription() *schema.Resource {
 				Required:    true,
 				Sensitive:   true,
 				ForceNew:    true,
-				Description: "The Pritunl license key to activate. Write-only on the Pritunl API; a changed key replaces the resource.",
+				Description: "The Pritunl license key to activate. Any pasted form is the same key: the server strips the BEGIN/END LICENSE markers and every non-alphanumeric character before validating, so the multi-line block and its single-line collapse are interchangeable. Write-only on the Pritunl API; a changed key replaces the resource.",
 			},
 			"status": {
 				Type:        schema.TypeString,
