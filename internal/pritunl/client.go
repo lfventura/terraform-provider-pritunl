@@ -52,6 +52,10 @@ type Client interface {
 	GetSettings() (Settings, error)
 	UpdateSettings(settings Settings) error
 
+	GetSubscription() (Subscription, error)
+	ActivateSubscription(license string) error
+	DeleteSubscription() error
+
 	GetAdministrators() ([]Administrator, error)
 	GetAdministrator(id string) (Administrator, error)
 	CreateAdministrator(administrator Administrator) (Administrator, error)
@@ -1134,6 +1138,81 @@ func decodeAdministrators(body []byte, target interface{}) error {
 	decoder.UseNumber()
 
 	return decoder.Decode(target)
+}
+
+func (c client) GetSubscription() (Subscription, error) {
+	var subscription Subscription
+
+	req, err := http.NewRequest("GET", "/subscription", nil)
+	if err != nil {
+		return subscription, err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return subscription, fmt.Errorf("GetSubscription: Error on HTTP request: %s", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return subscription, fmt.Errorf("Non-200 response on getting the subscription\ncode=%d\nbody=%s", resp.StatusCode, body)
+	}
+
+	err = json.Unmarshal(body, &subscription)
+	if err != nil {
+		return subscription, fmt.Errorf("GetSubscription: %s", err)
+	}
+
+	return subscription, nil
+}
+
+func (c client) ActivateSubscription(license string) error {
+	jsonData, err := json.Marshal(SubscriptionActivation{License: license})
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", "/subscription", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("ActivateSubscription: Error on HTTP request: %s", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		// Pritunl validates the key against its subscription server and
+		// answers an invalid or unreachable one with a json error document
+		// (e.g. 470 license_invalid), reported here verbatim.
+		return fmt.Errorf("Non-200 response on activating the subscription\ncode=%d\nbody=%s", resp.StatusCode, body)
+	}
+
+	return nil
+}
+
+func (c client) DeleteSubscription() error {
+	req, err := http.NewRequest("DELETE", "/subscription", nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("DeleteSubscription: Error on HTTP request: %s", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("Non-200 response on deleting the subscription\ncode=%d\nbody=%s", resp.StatusCode, body)
+	}
+
+	return nil
 }
 
 func NewClient(baseUrl, apiToken, apiSecret string, insecure bool) Client {
