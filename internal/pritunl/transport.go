@@ -5,8 +5,10 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -63,6 +65,13 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		resp, err := t.underlyingTransport.RoundTrip(req)
 
 		retriable := err != nil || resp.StatusCode >= 500
+		if req.Method == http.MethodPost {
+			// A POST that reached the server may have committed before the
+			// answer was lost, and replaying it would create a duplicate.
+			// Only an attempt that provably never left - a dial failure -
+			// retries.
+			retriable = isDialError(err)
+		}
 		replayable := req.Body == nil || req.GetBody != nil
 		if !retriable || !replayable || time.Now().After(deadline) {
 			return resp, err
@@ -84,6 +93,14 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			}
 		}
 	}
+}
+
+// isDialError reports whether the request never reached the server: the
+// connection itself could not be established, so nothing was delivered and
+// a replay cannot duplicate anything.
+func isDialError(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
 }
 
 func (t *transport) sign(req *http.Request) {
