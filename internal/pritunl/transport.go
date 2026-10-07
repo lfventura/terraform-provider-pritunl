@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"path"
@@ -21,6 +22,19 @@ type transport struct {
 	baseUrl             string
 }
 
+const (
+	// Pritunl restarts its web server right after some settings writes (a
+	// TLS certificate or port change), which surfaces to every concurrent
+	// caller as a transport error or a 5xx answer for a few seconds.
+	transportRetryWindow  = 75 * time.Second
+	transportRetryMaxWait = 10 * time.Second
+)
+
+// RoundTrip signs and sends the request, retrying transient failures —
+// transport errors and 5xx answers — until the retry window closes. Every
+// attempt signs the request again (the nonce is single-use server side)
+// and replays the body through GetBody; a request whose body cannot be
+// replayed is sent only once.
 func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Host == "" {
 		u, err := url.Parse(t.baseUrl)
@@ -32,6 +46,47 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		req.URL = u
 	}
 
+	deadline := time.Now().Add(transportRetryWindow)
+	wait := time.Second
+
+	for {
+		if req.Body != nil && req.GetBody != nil {
+			body, err := req.GetBody()
+			if err != nil {
+				return nil, err
+			}
+			req.Body = body
+		}
+
+		t.sign(req)
+
+		resp, err := t.underlyingTransport.RoundTrip(req)
+
+		retriable := err != nil || resp.StatusCode >= 500
+		replayable := req.Body == nil || req.GetBody != nil
+		if !retriable || !replayable || time.Now().After(deadline) {
+			return resp, err
+		}
+		if err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+
+		select {
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		case <-time.After(wait):
+		}
+		if wait < transportRetryMaxWait {
+			wait *= 2
+			if wait > transportRetryMaxWait {
+				wait = transportRetryMaxWait
+			}
+		}
+	}
+}
+
+func (t *transport) sign(req *http.Request) {
 	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
 	timestampNano := strconv.FormatInt(time.Now().UnixNano(), 10)
 
@@ -44,12 +99,10 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	mac.Write([]byte(authString))
 	signature := base64.StdEncoding.EncodeToString(mac.Sum(nil))
 
-	req.Header.Add("Auth-Token", t.apiToken)
-	req.Header.Add("Auth-Timestamp", timestamp)
-	req.Header.Add("Auth-Nonce", nonce)
-	req.Header.Add("Auth-Signature", signature)
+	req.Header.Set("Auth-Token", t.apiToken)
+	req.Header.Set("Auth-Timestamp", timestamp)
+	req.Header.Set("Auth-Nonce", nonce)
+	req.Header.Set("Auth-Signature", signature)
 
-	req.Header.Add("Content-Type", "application/json")
-
-	return t.underlyingTransport.RoundTrip(req)
+	req.Header.Set("Content-Type", "application/json")
 }
