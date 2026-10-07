@@ -41,6 +41,8 @@ type Client interface {
 	UpdateRouteOnServer(serverId string, route Route) error
 
 	GetHosts() ([]Host, error)
+	GetHost(id string) (*Host, error)
+	UpdateHost(id string, host HostUpdate) (*Host, error)
 	GetHostsByServer(serverId string) ([]Host, error)
 	AttachHostToServer(hostId, serverId string) error
 	DetachHostFromServer(hostId, serverId string) error
@@ -1213,6 +1215,65 @@ func (c client) DeleteSubscription() error {
 	}
 
 	return nil
+}
+
+func (c client) GetHost(id string) (*Host, error) {
+	req, err := http.NewRequest("GET", fmt.Sprintf("/host/%s", id), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("GetHost: Error on HTTP request: %s", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 404 {
+		return nil, nil
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("Non-200 response on getting the host\ncode=%d\nbody=%s", resp.StatusCode, body)
+	}
+
+	var host Host
+	if err := json.Unmarshal(body, &host); err != nil {
+		return nil, fmt.Errorf("GetHost: %s", err)
+	}
+
+	return &host, nil
+}
+
+func (c client) UpdateHost(id string, host HostUpdate) (*Host, error) {
+	jsonData, err := json.Marshal(host)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("PUT", fmt.Sprintf("/host/%s", id), bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("UpdateHost: Error on HTTP request: %s", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("Non-200 response on updating the host\ncode=%d\nbody=%s", resp.StatusCode, body)
+	}
+
+	var updated Host
+	if err := json.Unmarshal(body, &updated); err != nil {
+		return nil, fmt.Errorf("UpdateHost: %s", err)
+	}
+
+	return &updated, nil
 }
 
 func NewClient(baseUrl, apiToken, apiSecret string, insecure bool) Client {
