@@ -269,6 +269,10 @@ func validateSsoRawConfig(config cty.Value) error {
 				return fmt.Errorf("sso = %q turns single sign-on off and takes no companion attribute: %s would never be applied — Pritunl ignores or clears every single sign-on setting handed over with a falsy provider — so remove it from the configuration", ssoDisabled, key)
 			}
 		}
+	default:
+		// a value the plan only knew as unknown bypasses the ValidateFunc, so
+		// the two-value contract of the schema is enforced here as well
+		return fmt.Errorf("sso must be %q or %q, got %q", ssoSamlOkta, ssoDisabled, sso.AsString())
 	}
 
 	return nil

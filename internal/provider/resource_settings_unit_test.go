@@ -104,6 +104,10 @@ func TestValidateSsoRawConfig(t *testing.T) {
 			}),
 			wantErr: "server_sso_url",
 		},
+		"a value the schema never accepts": {
+			config:  ssoRawConfig(map[string]cty.Value{"sso": cty.StringVal("saml_okta_duo")}),
+			wantErr: "must be",
+		},
 		"disabled on its own": {
 			config: ssoRawConfig(map[string]cty.Value{"sso": cty.StringVal(ssoDisabled)}),
 		},
