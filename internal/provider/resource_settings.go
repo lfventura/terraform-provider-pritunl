@@ -20,6 +20,13 @@ import (
 // provided one. It is also the import id of the resource.
 const settingsResourceId = "settings"
 
+// The two spellings of a managed single sign-on. Absence is the third state:
+// the single sign-on of the instance is left exactly as it is.
+const (
+	ssoSamlOkta = "saml_okta"
+	ssoDisabled = "disabled"
+)
+
 const (
 	// Pritunl schedules the web server restart shortly after answering the
 	// request, so the endpoint is given a head start before being polled and
@@ -74,14 +81,16 @@ func resourceSettings() *schema.Resource {
 			// the single sign-on attributes are always written together:
 			// Pritunl clears every sso_* setting of the instance as soon as the
 			// provider it receives is falsy, and rejects a provider that comes
-			// without an organization or a domain with a 400
+			// without an organization or a domain with a 400. saml_okta requires
+			// sso_org and server_sso_url while disabled takes no companion at
+			// all, which RequiredWith cannot express, so the cross-attribute
+			// rules live in the CustomizeDiff instead.
 			"sso": {
 				Type:         schema.TypeString,
 				Optional:     true,
 				Computed:     true,
-				ValidateFunc: validation.StringInSlice([]string{"saml_okta"}, false),
-				RequiredWith: []string{"sso_org", "server_sso_url"},
-				Description:  "The single sign-on provider the instance authenticates its users against. Only `saml_okta` is accepted, the value the `Okta` entry of the web console stands for: Okta is a SAML integration underneath, which is why an Okta configuration is made of both the SAML attributes (`sso_saml_url`, `sso_saml_issuer_url`, `sso_saml_cert`) and the Okta ones (`sso_okta_app_id`, `sso_okta_token`, `sso_okta_mode`). The console offers `saml_okta_duo` and `saml_okta_yubico` next to it, the same integration with a Duo or a Yubico second factor bolted on, and neither is supported here: they need credentials this resource does not manage. `sso_org` and `server_sso_url` are required along with it, Pritunl answers a single sign-on configuration missing the organization or the domain with a `400`, and a working Okta integration also needs the three SAML attributes, which are left to the instance when they are not configured. Leaving the attribute out of the configuration keeps the single sign-on of the instance exactly as it is: this resource never turns it off, because Pritunl clears every single sign-on credential it holds, for every provider, as soon as it is handed a falsy one. Single sign-on is disabled from the web console instead, and the next plan then reports it as a drift from the configuration.",
+				ValidateFunc: validation.StringInSlice([]string{ssoSamlOkta, ssoDisabled}, false),
+				Description:  "The single sign-on of the instance, either `saml_okta` for users authenticated against Okta or `disabled` for single sign-on managed off. `saml_okta` is the value the `Okta` entry of the web console stands for: Okta is a SAML integration underneath, which is why an Okta configuration is made of both the SAML attributes (`sso_saml_url`, `sso_saml_issuer_url`, `sso_saml_cert`) and the Okta ones (`sso_okta_app_id`, `sso_okta_token`, `sso_okta_mode`). The console offers `saml_okta_duo` and `saml_okta_yubico` next to it, the same integration with a Duo or a Yubico second factor bolted on, and neither is supported here: they need credentials this resource does not manage. `sso_org` and `server_sso_url` are required along with `saml_okta`, Pritunl answers a single sign-on configuration missing the organization or the domain with a `400`, and a working Okta integration also needs the three SAML attributes, which are left to the instance when they are not configured. `disabled` turns single sign-on off and keeps it off: Pritunl clears every single sign-on credential it holds, for every provider — the Okta token, the SAML certificate and the URLs among them — which is irreversible, so turning it back on means configuring the credentials again; it takes no companion attribute, and someone re-enabling single sign-on from the console shows up as a drift the next apply turns off again. Leaving the attribute out of the configuration keeps the single sign-on of the instance exactly as it is: absence never turns anything off, turning single sign-on off is only ever the written `disabled`.",
 			},
 			"sso_saml_url": {
 				Type:         schema.TypeString,
@@ -133,7 +142,7 @@ func resourceSettings() *schema.Resource {
 				Computed:     true,
 				RequiredWith: []string{"sso"},
 				ValidateFunc: validation.StringInSlice([]string{"", "passcode", "push", "push_none"}, false),
-				Description:  "The secondary factor Okta asks the users for, one of `passcode`, `push`, `push_none` for a push notification whenever the user has a device that takes one, and the empty string for no secondary factor at all, the four entries the web console offers. Pritunl only takes it over while `sso` is exactly `saml_okta`, it silently drops the setting for every other provider, which is why it is required with `sso` here. Leaving it out of the configuration keeps the mode the instance already runs with, and configuring it as the empty string is what turns the secondary factor off.",
+				Description:  "The secondary factor Okta asks the users for, one of `passcode`, `push`, `push_none` for a push notification whenever the user has a device that takes one, and the empty string for no secondary factor at all, the four entries the web console offers. Pritunl only takes it over while `sso` is exactly `saml_okta`, it silently drops the setting for every other provider, which is why it is required with `sso` here and refused next to `sso = \"disabled\"`. Leaving it out of the configuration keeps the mode the instance already runs with, and configuring it as the empty string is what turns the secondary factor off.",
 			},
 			"sso_org": {
 				Type:         schema.TypeString,
@@ -193,8 +202,9 @@ func resourceSettings() *schema.Resource {
 	}
 }
 
-// customizeSettingsDiff puts the change of sso_okta_mode back on the plan when
-// it is being turned off.
+// customizeSettingsDiff validates the single sign-on block of the raw
+// configuration and puts the change of sso_okta_mode back on the plan when it
+// is being turned off.
 //
 // The empty mode is the Okta secondary factor disabled, a value of its own, but
 // the SDK reads the empty string of a computed attribute as "not configured"
@@ -206,6 +216,10 @@ func customizeSettingsDiff(ctx context.Context, d *schema.ResourceDiff, meta int
 	config := d.GetRawConfig()
 	if config.IsNull() || !config.IsKnown() {
 		return nil
+	}
+
+	if err := validateSsoRawConfig(config); err != nil {
+		return err
 	}
 
 	mode := config.GetAttr("sso_okta_mode")
@@ -221,6 +235,39 @@ func customizeSettingsDiff(ctx context.Context, d *schema.ResourceDiff, meta int
 	}
 
 	return d.SetNew("sso_okta_mode", "")
+}
+
+// validateSsoRawConfig enforces the cross-attribute rules of the single
+// sign-on block, which differ per sso value and are therefore out of reach for
+// the static RequiredWith: saml_okta has to come along with sso_org and
+// server_sso_url, the two companions Pritunl answers a 400 without, while
+// disabled takes no companion at all — Pritunl clears every single sign-on
+// setting on a falsy provider, so a companion configured next to disabled
+// would be silently thrown away, and is refused instead. An unknown value
+// counts as present: it is a reference that only resolves during the apply,
+// such as the id of an organization being created in the same run.
+func validateSsoRawConfig(config cty.Value) error {
+	sso := config.GetAttr("sso")
+	if sso.IsNull() || !sso.IsKnown() {
+		return nil
+	}
+
+	switch sso.AsString() {
+	case ssoSamlOkta:
+		for _, key := range []string{"sso_org", "server_sso_url"} {
+			if config.GetAttr(key).IsNull() {
+				return fmt.Errorf("sso = %q requires %s: Pritunl refuses a single sign-on configuration without it with a 400", ssoSamlOkta, key)
+			}
+		}
+	case ssoDisabled:
+		for _, key := range append([]string{"sso_okta_mode"}, settingsSsoAttributes...) {
+			if !config.GetAttr(key).IsNull() {
+				return fmt.Errorf("sso = %q turns single sign-on off and takes no companion attribute: %s would be cleared by Pritunl along with every other single sign-on setting, remove it from the configuration", ssoDisabled, key)
+			}
+		}
+	}
+
+	return nil
 }
 
 // Pritunl strips the surrounding whitespace of the PEM values before storing
@@ -416,9 +463,18 @@ func resourceReadSettings(ctx context.Context, d *schema.ResourceData, meta inte
 	d.Set("pin_mode", settings.String("pin_mode"))
 
 	// sso reads as the boolean false on an instance where single sign-on has
-	// never been configured, which String turns into the empty string, the very
-	// same thing it means to Pritunl
-	d.Set("sso", settings.String("sso"))
+	// never been configured, and as the empty string once it has been turned
+	// off; String reports both as the empty string, the very same thing they
+	// mean to Pritunl. When this resource is the one keeping single sign-on
+	// off, the configured spelling is what the state carries: disabled and the
+	// empty read are the same instance value, and keeping the written one is
+	// what lets the plan settle — while an instance someone re-enabled from
+	// the console reads back as its provider and surfaces as a drift.
+	sso := settings.String("sso")
+	if sso == "" && d.Get("sso").(string) == ssoDisabled {
+		sso = ssoDisabled
+	}
+	d.Set("sso", sso)
 	d.Set("sso_org", settings.String("sso_org"))
 	d.Set("sso_saml_url", settings.String("sso_saml_url"))
 	d.Set("sso_saml_issuer_url", settings.String("sso_saml_issuer_url"))
@@ -500,19 +556,26 @@ func overlaySettings(d *schema.ResourceData, settings pritunl.Settings) bool {
 	// the organization and the domain, which Pritunl refuses to do without. A
 	// configuration that manages no single sign-on hands no provider over at
 	// all, blank or otherwise, and the round trip gives the instance its own
-	// one back along with the credentials that belong to it.
+	// one back along with the credentials that belong to it. The configured
+	// disabled is the one deliberate falsy: the empty string is the falsy
+	// pritunl-web accepts (see Settings.normalize), and the backend clears
+	// every single sign-on setting along with it, companions included.
 	if sso := strings.TrimSpace(d.Get("sso").(string)); settingConfigured(d, "sso") && sso != "" {
-		settings["sso"] = sso
+		if sso == ssoDisabled {
+			settings["sso"] = ""
+		} else {
+			settings["sso"] = sso
 
-		for _, attribute := range settingsSsoAttributes {
-			overlaySettingsString(d, settings, attribute)
-		}
+			for _, attribute := range settingsSsoAttributes {
+				overlaySettingsString(d, settings, attribute)
+			}
 
-		// the empty mode is the secondary factor turned off, a value of its
-		// own that has to be told apart from an unmanaged attribute, and one
-		// the plan hands over as unknown rather than as the empty string
-		if mode, configured := settingConfiguredString(d, "sso_okta_mode"); configured {
-			settings["sso_okta_mode"] = mode
+			// the empty mode is the secondary factor turned off, a value of its
+			// own that has to be told apart from an unmanaged attribute, and one
+			// the plan hands over as unknown rather than as the empty string
+			if mode, configured := settingConfiguredString(d, "sso_okta_mode"); configured {
+				settings["sso_okta_mode"] = mode
+			}
 		}
 	}
 
