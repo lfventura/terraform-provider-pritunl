@@ -644,6 +644,88 @@ func TestAccPritunlSettingsSingleSignOn(t *testing.T) {
 		})
 	})
 
+	// The written disabled is the one way this resource turns single sign-on
+	// off: the overlay hands Pritunl the falsy provider it clears every
+	// credential on, the state keeps the configured spelling so the plan
+	// settles, and someone re-enabling single sign-on from the console reads
+	// back as the provider itself, a drift the next apply turns off again.
+	t.Run("turns single sign-on off with disabled", func(t *testing.T) {
+		if os.Getenv("TF_ACC") == "" {
+			t.Skip("TF_ACC is not set, skipping the acceptance test")
+		}
+
+		organization, err := testClient.CreateOrganization("tfacc-settings-sso-off")
+		if err != nil {
+			t.Fatalf("failed to create the organization of the single sign-on: %s", err)
+		}
+
+		t.Cleanup(func() {
+			testClient.DeleteOrganization(organization.ID)
+		})
+
+		restoreSettings(t, settingsSsoAttributes...)
+		restoreSettings(t, "sso", "sso_okta_mode")
+
+		enabled := settingsWith(configured, map[string]interface{}{
+			"sso_org": organization.ID,
+		})
+
+		// single sign-on is on before the configuration turns it off
+		settingsBaseline(t, enabled)
+
+		// the write stands on Pritunl clearing every single sign-on credential
+		// along with the falsy provider, so the credentials the baseline just
+		// populated have to be gone from the instance, not just the provider
+		ssoIsOff := func(s *terraform.State) error {
+			settings, err := testClient.GetSettings()
+			if err != nil {
+				return err
+			}
+
+			if sso := settings.String("sso"); sso != "" {
+				return fmt.Errorf("single sign-on is still %q on the instance, want it off", sso)
+			}
+
+			for _, attribute := range settingsSsoAttributes {
+				if value := settings.String(attribute); value != "" {
+					return fmt.Errorf("the single sign-on credential %q is still %q on the instance, want it cleared", attribute, value)
+				}
+			}
+
+			return nil
+		}
+
+		resource.Test(t, resource.TestCase{
+			PreCheck:          func() { preCheck(t) },
+			ProviderFactories: providerFactories,
+			// destroying the resource forgets it, single sign-on stays off
+			CheckDestroy: ssoIsOff,
+			Steps: []resource.TestStep{
+				{
+					// every step re-plans after applying, so the framework
+					// itself asserts that the disabled spelling settles
+					Config: testPritunlSettingsAttributeConfig("sso", `"disabled"`),
+					Check: resource.ComposeTestCheckFunc(
+						resource.TestCheckResourceAttr("pritunl_settings.test", "sso", "disabled"),
+						ssoIsOff,
+					),
+				},
+				{
+					// single sign-on turned back on from the console: a drift
+					// the very same configuration turns off again
+					PreConfig: func() {
+						writeSettings(t, enabled)
+					},
+					Config: testPritunlSettingsAttributeConfig("sso", `"disabled"`),
+					Check: resource.ComposeTestCheckFunc(
+						resource.TestCheckResourceAttr("pritunl_settings.test", "sso", "disabled"),
+						ssoIsOff,
+					),
+				},
+			},
+		})
+	})
+
 	// The web console only offers the secondary factor of Okta while the
 	// provider is exactly saml_okta, and the API turns out to enforce that
 	// rather than merely hide it: the handler drops the setting for every other
