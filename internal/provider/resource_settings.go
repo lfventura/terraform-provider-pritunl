@@ -266,7 +266,7 @@ func validateSsoRawConfig(config cty.Value) error {
 	case ssoDisabled:
 		for _, key := range append([]string{"sso_okta_mode"}, settingsSsoAttributes...) {
 			if !config.GetAttr(key).IsNull() {
-				return fmt.Errorf("sso = %q turns single sign-on off and takes no companion attribute: %s would be cleared by Pritunl along with every other single sign-on setting, remove it from the configuration", ssoDisabled, key)
+				return fmt.Errorf("sso = %q turns single sign-on off and takes no companion attribute: %s would never be applied — Pritunl ignores or clears every single sign-on setting handed over with a falsy provider — so remove it from the configuration", ssoDisabled, key)
 			}
 		}
 	}
