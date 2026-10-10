@@ -255,7 +255,11 @@ func validateSsoRawConfig(config cty.Value) error {
 	switch sso.AsString() {
 	case ssoSamlOkta:
 		for _, key := range []string{"sso_org", "server_sso_url"} {
-			if config.GetAttr(key).IsNull() {
+			value := config.GetAttr(key)
+			// a known blank is as missing as a null: the overlay trims and
+			// skips it, and Pritunl would refuse the write with the very 400
+			// this check exists to catch at plan time
+			if value.IsNull() || (value.IsKnown() && strings.TrimSpace(value.AsString()) == "") {
 				return fmt.Errorf("sso = %q requires %s: Pritunl refuses a single sign-on configuration without it with a 400", ssoSamlOkta, key)
 			}
 		}

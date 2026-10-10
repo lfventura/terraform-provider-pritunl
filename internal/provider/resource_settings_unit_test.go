@@ -89,6 +89,14 @@ func TestValidateSsoRawConfig(t *testing.T) {
 			}),
 			wantErr: "sso_org",
 		},
+		"saml_okta with a blank organization": {
+			config: ssoRawConfig(map[string]cty.Value{
+				"sso":            cty.StringVal(ssoSamlOkta),
+				"sso_org":        cty.StringVal("  "),
+				"server_sso_url": cty.StringVal("https://vpn.example.com"),
+			}),
+			wantErr: "sso_org",
+		},
 		"saml_okta without the domain": {
 			config: ssoRawConfig(map[string]cty.Value{
 				"sso":     cty.StringVal(ssoSamlOkta),
