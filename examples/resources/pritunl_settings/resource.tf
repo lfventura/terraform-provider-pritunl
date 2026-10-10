@@ -171,11 +171,17 @@ resource "pritunl_settings" "main" {
 # drops the setting for every other provider, which is why every Okta attribute
 # above is required with `sso`.
 #
-# Single sign-on is never turned off by this resource: dropping `sso` from the
-# configuration keeps what the instance has, and destroying the resource keeps
-# it as well, since handing Pritunl a blank provider would take the credentials
-# of the instance down with it. It is disabled from the web console instead, and
-# the next plan then reports it as a drift from the configuration.
+# Dropping `sso` from the configuration never turns single sign-on off: it
+# keeps what the instance has, and destroying the resource keeps it as well.
+# Turning it off is only ever the written `disabled`, which makes Pritunl clear
+# every single sign-on credential it holds — irreversibly, so turning it back on
+# means configuring the credentials again. It takes no companion attribute, and
+# someone re-enabling single sign-on from the console shows up as a drift the
+# next apply turns off again.
+#
+# resource "pritunl_settings" "sso_off" {
+#   sso = "disabled"
+# }
 #
 # `server_sso_url`, `sso_saml_url` and `sso_saml_issuer_url` are normalised by
 # recent Pritunl versions, which add the `https://` scheme when the value

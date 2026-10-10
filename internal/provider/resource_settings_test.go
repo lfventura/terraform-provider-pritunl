@@ -673,6 +673,9 @@ func TestAccPritunlSettingsSingleSignOn(t *testing.T) {
 		// single sign-on is on before the configuration turns it off
 		settingsBaseline(t, enabled)
 
+		// the write stands on Pritunl clearing every single sign-on credential
+		// along with the falsy provider, so the credentials the baseline just
+		// populated have to be gone from the instance, not just the provider
 		ssoIsOff := func(s *terraform.State) error {
 			settings, err := testClient.GetSettings()
 			if err != nil {
@@ -681,6 +684,12 @@ func TestAccPritunlSettingsSingleSignOn(t *testing.T) {
 
 			if sso := settings.String("sso"); sso != "" {
 				return fmt.Errorf("single sign-on is still %q on the instance, want it off", sso)
+			}
+
+			for _, attribute := range settingsSsoAttributes {
+				if value := settings.String(attribute); value != "" {
+					return fmt.Errorf("the single sign-on credential %q is still %q on the instance, want it cleared", attribute, value)
+				}
 			}
 
 			return nil

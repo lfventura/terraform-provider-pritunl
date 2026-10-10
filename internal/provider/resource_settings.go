@@ -158,7 +158,7 @@ func resourceSettings() *schema.Resource {
 				Computed:     true,
 				RequiredWith: []string{"sso"},
 				StateFunc:    trimSpaceStateFunc,
-				Description:  "The URL the users are sent to for the single sign-on exchange, which for most configurations is the URL the web console itself is reached at. Pritunl requires it as soon as `sso` is set and answers a configuration without it with a `400 sso_url_missing`. Recent versions normalise it before storing it, adding an `https://` scheme when the value carries none and lowercasing the host, so it is best configured already normalised, as in `https://vpn.example.com`: a value Pritunl rewrites reads back differently from the configured one and leaves a plan that never settles.",
+				Description:  "The URL the users are sent to for the single sign-on exchange, which for most configurations is the URL the web console itself is reached at. Pritunl requires it along with a `saml_okta` single sign-on and answers a configuration without it with a `400 sso_url_missing`; `disabled` takes no companion attribute. Recent versions normalise it before storing it, adding an `https://` scheme when the value carries none and lowercasing the host, so it is best configured already normalised, as in `https://vpn.example.com`: a value Pritunl rewrites reads back differently from the configured one and leaves a plan that never settles.",
 			},
 			"ipv6": {
 				Type:        schema.TypeBool,
