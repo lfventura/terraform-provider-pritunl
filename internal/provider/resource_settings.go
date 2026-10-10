@@ -459,7 +459,6 @@ func resourceCreateSettings(ctx context.Context, d *schema.ResourceData, meta in
 	return finishSettingsWrite(ctx, d, meta, portChanged)
 }
 
-// Uses for importing
 // validateSsoBeforeWrite runs the cross-attribute rules of the single sign-on
 // block again right before a write. The CustomizeDiff can only skip an sso the
 // plan does not know yet — a value resolving from another resource — and by
@@ -479,6 +478,7 @@ func validateSsoBeforeWrite(d *schema.ResourceData) diag.Diagnostics {
 	return nil
 }
 
+// Uses for importing
 func resourceReadSettings(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	apiClient := meta.(pritunl.Client)
 
