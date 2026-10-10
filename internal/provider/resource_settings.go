@@ -432,6 +432,10 @@ func settingsHaveChanges(d *schema.ResourceData) bool {
 func resourceCreateSettings(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	apiClient := meta.(pritunl.Client)
 
+	if diags := validateSsoBeforeWrite(d); diags != nil {
+		return diags
+	}
+
 	// the settings object always exists, there is nothing to create: the whole
 	// object is read, the managed attributes are overlaid on it and all of it
 	// is written back
@@ -452,6 +456,25 @@ func resourceCreateSettings(ctx context.Context, d *schema.ResourceData, meta in
 }
 
 // Uses for importing
+// validateSsoBeforeWrite runs the cross-attribute rules of the single sign-on
+// block again right before a write. The CustomizeDiff can only skip an sso the
+// plan does not know yet — a value resolving from another resource — and by
+// write time it has resolved, so this is where a disabled that would silently
+// discard a configured companion, or a saml_okta missing the fields Pritunl
+// refuses with a 400, is caught instead of reaching the instance.
+func validateSsoBeforeWrite(d *schema.ResourceData) diag.Diagnostics {
+	config := d.GetRawConfig()
+	if config.IsNull() || !config.IsKnown() {
+		return nil
+	}
+
+	if err := validateSsoRawConfig(config); err != nil {
+		return diag.FromErr(err)
+	}
+
+	return nil
+}
+
 func resourceReadSettings(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	apiClient := meta.(pritunl.Client)
 
@@ -511,6 +534,10 @@ func resourceUpdateSettings(ctx context.Context, d *schema.ResourceData, meta in
 
 	if !settingsHaveChanges(d) {
 		return resourceReadSettings(ctx, d, meta)
+	}
+
+	if diags := validateSsoBeforeWrite(d); diags != nil {
+		return diags
 	}
 
 	settings, err := apiClient.GetSettings()
