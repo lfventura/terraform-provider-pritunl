@@ -999,7 +999,16 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 	// Stop server before applying any change
 	err = apiClient.StopServer(d.Id())
 	if err != nil {
-		return diag.Errorf("Error on stopping server: %s", err)
+		// A transport failure can land after Pritunl already stopped the
+		// server, so a desired-online server gets the recovery start on this
+		// path too; the stop error always comes first.
+		stopDiags := diag.Errorf("Error on stopping server: %s", err)
+		if shouldServerBeStarted {
+			if startErr := apiClient.StartServer(d.Id()); startErr != nil {
+				return append(stopDiags, diag.Errorf("Error on starting the server back after the failed stop: %s", startErr)...)
+			}
+		}
+		return stopDiags
 	}
 
 	applyDiags := func() diag.Diagnostics {

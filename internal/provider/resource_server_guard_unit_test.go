@@ -24,6 +24,7 @@ type guardClient struct {
 	stopped     map[string]bool
 	maxStopped  int
 	updateDelay time.Duration
+	stopErr     error
 	updateErr   error
 	startErr    error
 	startCalls  []string
@@ -40,6 +41,11 @@ func (c *guardClient) GetServer(id string) (*pritunl.Server, error) {
 func (c *guardClient) StopServer(id string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.stopErr != nil {
+		// the transport failure lands after the stop took effect
+		c.stopped[id] = true
+		return c.stopErr
+	}
 	c.stopped[id] = true
 	if len(c.stopped) > c.maxStopped {
 		c.maxStopped = len(c.stopped)
@@ -127,6 +133,27 @@ func TestServerUpdateFailureStartsServerBack(t *testing.T) {
 	}
 	if len(apiClient.startCalls) != 1 || apiClient.startCalls[0] != "srv1" {
 		t.Fatalf("the server should be started back after the failure, start calls: %v", apiClient.startCalls)
+	}
+	if len(apiClient.stopped) != 0 {
+		t.Fatalf("no server should be left down, still down: %v", apiClient.stopped)
+	}
+}
+
+// A stop whose response is lost after Pritunl already stopped the server gets
+// the recovery start too, with the stop error first.
+func TestServerUpdateStopFailureStartsServerBack(t *testing.T) {
+	apiClient := newGuardClient()
+	apiClient.stopErr = errors.New("simulated transport failure")
+
+	diags := resourceUpdateServer(context.Background(), guardResourceData(t, "srv1"), pritunl.Client(apiClient))
+	if !diags.HasError() {
+		t.Fatal("the failed stop should return the error")
+	}
+	if !strings.Contains(diags[0].Summary, "simulated transport failure") {
+		t.Fatalf("the stop error should come first, got: %s", diags[0].Summary)
+	}
+	if len(apiClient.startCalls) != 1 || apiClient.startCalls[0] != "srv1" {
+		t.Fatalf("the server should be started back after the failed stop, start calls: %v", apiClient.startCalls)
 	}
 	if len(apiClient.stopped) != 0 {
 		t.Fatalf("no server should be left down, still down: %v", apiClient.stopped)
