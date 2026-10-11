@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/go-cty/cty"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
@@ -16,7 +17,7 @@ import (
 
 func resourceServer() *schema.Resource {
 	return &schema.Resource{
-		Description: "The server resource manages a Pritunl VPN server. Updating a running server stops it, applies the whole change set and starts it again. The stop→start window is serialized across the provider process, so an apply that updates several servers takes down at most one at a time, and a Pritunl API failure inside the window starts the server back before the error returns. A server left down by a failed recovery start blocks further updates from stopping another server until it is back online. The one gap no client-side guard closes is the terraform process itself dying between the stop and the start — for example when the apply runs over the very VPN being updated — which leaves the server stopped until it is started from the console; run applies over a network path that does not depend on the servers being changed.",
+		Description: "The server resource manages a Pritunl VPN server. Updating a running server stops it, applies the whole change set and starts it again. The stop→start window is serialized across the provider process, so an apply that updates several servers takes down at most one at a time, and a Pritunl API failure inside the window starts the server back before the error returns. The final start only counts once the server reports online again, and a server left down by a failed recovery blocks the remaining updates of the same apply (the provider process) from stopping another server until it is back online; across provider runs the marker starts clean, so a server left down is started from the console. The one gap no client-side guard closes is the terraform process itself dying between the stop and the start — for example when the apply runs over the very VPN being updated — which leaves the server stopped until it is started from the console; run applies over a network path that does not depend on the servers being changed.",
 		Schema: map[string]*schema.Schema{
 			"name": {
 				Type:        schema.TypeString,
@@ -807,6 +808,36 @@ var (
 	serverLeftDownId string
 )
 
+// confirmServerOnline holds the caller inside the downtime window until the
+// started server actually reports online: a 200 on the start request only
+// queues the startup, and the one-server-down invariant is about
+// availability, not about requests sent.
+var (
+	serverOnlineConfirmTimeout  = 90 * time.Second
+	serverOnlineConfirmInterval = 2 * time.Second
+)
+
+func confirmServerOnline(ctx context.Context, apiClient pritunl.Client, id string) error {
+	deadline := time.Now().Add(serverOnlineConfirmTimeout)
+	for {
+		server, err := apiClient.GetServer(id)
+		if err == nil && server.Status == pritunl.ServerStatusOnline {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				return fmt.Errorf("the server did not report online after the start: %s", err)
+			}
+			return fmt.Errorf("the server did not report online after the start (status %q)", server.Status)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(serverOnlineConfirmInterval):
+		}
+	}
+}
+
 func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	apiClient := meta.(pritunl.Client)
 
@@ -1025,6 +1056,10 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 				serverLeftDownId = d.Id()
 				return append(stopDiags, diag.Errorf("Error on starting the server back after the failed stop: %s", startErr)...)
 			}
+			if confirmErr := confirmServerOnline(ctx, apiClient, d.Id()); confirmErr != nil {
+				serverLeftDownId = d.Id()
+				return append(stopDiags, diag.FromErr(confirmErr)...)
+			}
 		}
 		return stopDiags
 	}
@@ -1145,6 +1180,10 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 				serverLeftDownId = d.Id()
 				return append(applyDiags, diag.Errorf("Error on starting the server back after the failed update: %s", startErr)...)
 			}
+			if confirmErr := confirmServerOnline(ctx, apiClient, d.Id()); confirmErr != nil {
+				serverLeftDownId = d.Id()
+				return append(applyDiags, diag.FromErr(confirmErr)...)
+			}
 		}
 		return applyDiags
 	}
@@ -1154,6 +1193,10 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 		if err != nil {
 			serverLeftDownId = d.Id()
 			return diag.Errorf("Error on starting server: %s", err)
+		}
+		if confirmErr := confirmServerOnline(ctx, apiClient, d.Id()); confirmErr != nil {
+			serverLeftDownId = d.Id()
+			return diag.FromErr(confirmErr)
 		}
 	}
 

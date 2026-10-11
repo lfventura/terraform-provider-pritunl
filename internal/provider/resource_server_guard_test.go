@@ -62,26 +62,45 @@ func createLabServer(t *testing.T, name, network string, port int) string {
 	if err := testClient.AttachOrganizationToServer(organization.ID, server.ID); err != nil {
 		t.Fatalf("attaching the lab organization to %s: %s", name, err)
 	}
-	if err := testClient.StartServer(server.ID); err != nil {
-		t.Fatalf("starting the lab server %s: %s", name, err)
+	// A cold lab container sometimes leaves the first start queued
+	// indefinitely; a stop→start nudge clears it, so the setup retries the
+	// cycle instead of failing the behavior under test on boot flakiness.
+	for attempt := 1; ; attempt++ {
+		if err := testClient.StartServer(server.ID); err != nil {
+			t.Fatalf("starting the lab server %s: %s", name, err)
+		}
+		if labServerReaches(server.ID, pritunl.ServerStatusOnline, 140*time.Second) {
+			break
+		}
+		if attempt == 3 {
+			t.Fatalf("server %s did not reach status online after %d start attempts", name, attempt)
+		}
+		if err := testClient.StopServer(server.ID); err != nil {
+			t.Fatalf("stopping the lab server %s between start attempts: %s", name, err)
+		}
 	}
-	waitLabServerStatus(t, server.ID, pritunl.ServerStatusOnline)
 
 	return server.ID
+}
+
+func labServerReaches(id, status string, window time.Duration) bool {
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		server, err := testClient.GetServer(id)
+		if err == nil && server.Status == status {
+			return true
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return false
 }
 
 func waitLabServerStatus(t *testing.T, id, status string) {
 	t.Helper()
 
-	deadline := time.Now().Add(420 * time.Second)
-	for time.Now().Before(deadline) {
-		server, err := testClient.GetServer(id)
-		if err == nil && server.Status == status {
-			return
-		}
-		time.Sleep(2 * time.Second)
+	if !labServerReaches(id, status, 180*time.Second) {
+		t.Fatalf("server %s did not reach status %q in time", id, status)
 	}
-	t.Fatalf("server %s did not reach status %q in time", id, status)
 }
 
 func guardLabResourceData(t *testing.T, id, name string) *schema.ResourceData {

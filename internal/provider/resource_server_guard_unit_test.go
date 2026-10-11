@@ -27,6 +27,7 @@ type guardClient struct {
 	stopErr     error
 	updateErr   error
 	startErr    error
+	startSilent bool
 	startCalls  []string
 }
 
@@ -51,6 +52,19 @@ func resetDowntimeGuard() {
 	serverDowntimeMu.Unlock()
 }
 
+func shortConfirmWindow(t *testing.T) {
+	prevTimeout, prevInterval := serverOnlineConfirmTimeout, serverOnlineConfirmInterval
+	serverOnlineConfirmTimeout = 50 * time.Millisecond
+	serverOnlineConfirmInterval = 10 * time.Millisecond
+	t.Cleanup(func() {
+		serverOnlineConfirmTimeout = prevTimeout
+		serverOnlineConfirmInterval = prevInterval
+		// the downtime marker is process-wide: a test that ends blocked must
+		// not poison whatever runs after it
+		resetDowntimeGuard()
+	})
+}
+
 func (c *guardClient) StopServer(id string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -72,6 +86,10 @@ func (c *guardClient) StartServer(id string) error {
 	c.startCalls = append(c.startCalls, id)
 	if c.startErr != nil {
 		return c.startErr
+	}
+	if c.startSilent {
+		// the start request is accepted but the server never comes up
+		return nil
 	}
 	delete(c.stopped, id)
 	return nil
@@ -106,6 +124,7 @@ func guardResourceData(t *testing.T, id string) *schema.ResourceData {
 // serializes the stop→start window, whatever parallelism Terraform runs with.
 func TestServerUpdateDowntimeIsSerialized(t *testing.T) {
 	resetDowntimeGuard()
+	shortConfirmWindow(t)
 	apiClient := newGuardClient()
 	apiClient.updateDelay = 50 * time.Millisecond
 
@@ -136,6 +155,7 @@ func TestServerUpdateDowntimeIsSerialized(t *testing.T) {
 // before the error returns, and the original error stays first.
 func TestServerUpdateFailureStartsServerBack(t *testing.T) {
 	resetDowntimeGuard()
+	shortConfirmWindow(t)
 	apiClient := newGuardClient()
 	apiClient.updateErr = errors.New("simulated api rejection")
 
@@ -158,6 +178,7 @@ func TestServerUpdateFailureStartsServerBack(t *testing.T) {
 // the recovery start too, with the stop error first.
 func TestServerUpdateStopFailureStartsServerBack(t *testing.T) {
 	resetDowntimeGuard()
+	shortConfirmWindow(t)
 	apiClient := newGuardClient()
 	apiClient.stopErr = errors.New("simulated transport failure")
 
@@ -180,6 +201,7 @@ func TestServerUpdateStopFailureStartsServerBack(t *testing.T) {
 // one stays first.
 func TestServerUpdateFailureReportsBothErrors(t *testing.T) {
 	resetDowntimeGuard()
+	shortConfirmWindow(t)
 	apiClient := newGuardClient()
 	apiClient.updateErr = errors.New("simulated api rejection")
 	apiClient.startErr = errors.New("simulated start failure")
@@ -201,6 +223,7 @@ func TestServerUpdateFailureReportsBothErrors(t *testing.T) {
 // online, and unblocks once it is.
 func TestServerUpdateQueueBlocksWhileServerIsLeftDown(t *testing.T) {
 	resetDowntimeGuard()
+	shortConfirmWindow(t)
 	apiClient := newGuardClient()
 	apiClient.updateErr = errors.New("simulated api rejection")
 	apiClient.startErr = errors.New("simulated start failure")
@@ -228,5 +251,28 @@ func TestServerUpdateQueueBlocksWhileServerIsLeftDown(t *testing.T) {
 	apiClient.mu.Unlock()
 	if diags := resourceUpdateServer(context.Background(), guardResourceData(t, "srv2"), pritunl.Client(apiClient)); diags.HasError() {
 		t.Fatalf("the queue should unblock once srv1 is back online: %v", diags)
+	}
+}
+
+// A start request that is accepted but never brings the server online fails
+// the update, marks the server as left down and blocks the queue.
+func TestServerUpdateUnconfirmedStartBlocksQueue(t *testing.T) {
+	resetDowntimeGuard()
+	shortConfirmWindow(t)
+	apiClient := newGuardClient()
+	apiClient.startSilent = true
+
+	diags := resourceUpdateServer(context.Background(), guardResourceData(t, "srv1"), pritunl.Client(apiClient))
+	if !diags.HasError() || !strings.Contains(diags[len(diags)-1].Summary, "did not report online") {
+		t.Fatalf("the unconfirmed start should fail the update, got: %v", diags)
+	}
+
+	apiClient.startSilent = false
+	diags = resourceUpdateServer(context.Background(), guardResourceData(t, "srv2"), pritunl.Client(apiClient))
+	if !diags.HasError() || !strings.Contains(diags[0].Summary, "still down") {
+		t.Fatalf("the queue should stay blocked while srv1 never confirmed online, got: %v", diags)
+	}
+	if apiClient.stopped["srv2"] {
+		t.Fatal("srv2 should not have been stopped while srv1 is down")
 	}
 }

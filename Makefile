@@ -33,6 +33,6 @@ test:
 	PRITUNL_INSECURE="true" \
 	PRITUNL_TOKEN=tfacctest_token \
 	PRITUNL_SECRET=tfacctest_secret \
-	go test -v -cover -count 1 ./internal/provider
+	go test -v -cover -count 1 -timeout 30m ./internal/provider
 
 	@docker rm tf_pritunl_acc_test -f
