@@ -48,7 +48,7 @@ func (c *guardClient) GetServer(id string) (*pritunl.Server, error) {
 // resetDowntimeGuard clears the process-wide downtime state between tests.
 func resetDowntimeGuard() {
 	serverDowntimeMu.Lock()
-	serverLeftDownId = ""
+	serverLeftDown.client, serverLeftDown.id = nil, ""
 	serverDowntimeMu.Unlock()
 }
 
@@ -312,5 +312,39 @@ func TestServerUpdateRetryWithoutStartKeepsQueueBlocked(t *testing.T) {
 	apiClient.mu.Unlock()
 	if diags := resourceUpdateServer(context.Background(), guardResourceData(t, "srv2"), pritunl.Client(apiClient)); diags.HasError() {
 		t.Fatalf("the queue should unblock once srv1 is back online: %v", diags)
+	}
+}
+
+// The fence binds to the endpoint that left the server down: a second
+// provider configuration with a colliding server ID neither bypasses it nor
+// clears it against the wrong endpoint.
+func TestServerUpdateFenceIsPerEndpoint(t *testing.T) {
+	resetDowntimeGuard()
+	shortConfirmWindow(t)
+	endpointA := newGuardClient()
+	endpointA.updateErr = errors.New("simulated api rejection")
+	endpointA.startErr = errors.New("simulated start failure")
+
+	if diags := resourceUpdateServer(context.Background(), guardResourceData(t, "srv1"), pritunl.Client(endpointA)); !diags.HasError() {
+		t.Fatal("the first update should fail and leave srv1 down on endpoint A")
+	}
+
+	// same server ID on another endpoint: not a retry, and the liveness check
+	// must ask endpoint A, which still reports srv1 down
+	endpointB := newGuardClient()
+	diags := resourceUpdateServer(context.Background(), guardResourceData(t, "srv1"), pritunl.Client(endpointB))
+	if !diags.HasError() || !strings.Contains(diags[0].Summary, "still down") {
+		t.Fatalf("the colliding ID on another endpoint should stay fenced, got: %v", diags)
+	}
+	if len(endpointB.stopped) != 0 || len(endpointB.startCalls) != 0 {
+		t.Fatal("endpoint B should not have been touched while endpoint A has a server down")
+	}
+
+	// endpoint A recovers: the fence lifts for everyone
+	endpointA.mu.Lock()
+	delete(endpointA.stopped, "srv1")
+	endpointA.mu.Unlock()
+	if diags := resourceUpdateServer(context.Background(), guardResourceData(t, "srv1"), pritunl.Client(endpointB)); diags.HasError() {
+		t.Fatalf("the fence should lift once endpoint A recovers: %v", diags)
 	}
 }

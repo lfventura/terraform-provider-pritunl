@@ -805,7 +805,15 @@ func resourceCreateServer(ctx context.Context, d *schema.ResourceData, meta inte
 // guarded by the mutex.
 var (
 	serverDowntimeMu sync.Mutex
-	serverLeftDownId string
+	// serverLeftDown identifies a server whose recovery start failed, keyed by
+	// the provider configuration (client) that owns it alongside the ID:
+	// aliased configurations may target different Pritunl endpoints with
+	// colliding server IDs, and both the fence check and the retry exemption
+	// must bind to the originating endpoint.
+	serverLeftDown struct {
+		client pritunl.Client
+		id     string
+	}
 )
 
 // confirmServerOnline holds the caller inside the downtime window until the
@@ -1033,16 +1041,18 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 	serverDowntimeMu.Lock()
 	defer serverDowntimeMu.Unlock()
 
-	// Updating the down server itself is the path that brings it back, so it
-	// passes the fence; the marker only clears further down, once this update
-	// confirms the server online (or the configuration turns it offline on
-	// purpose).
-	if serverLeftDownId != "" && serverLeftDownId != d.Id() {
-		downServer, downErr := apiClient.GetServer(serverLeftDownId)
+	// Updating the down server itself, through the configuration that owns
+	// it, is the path that brings it back, so it passes the fence; the marker
+	// only clears further down, once this update confirms the server online
+	// (or the configuration turns it offline on purpose). The liveness check
+	// always asks the endpoint that left the server down.
+	retryingDownServer := serverLeftDown.id == d.Id() && serverLeftDown.client == apiClient
+	if serverLeftDown.id != "" && !retryingDownServer {
+		downServer, downErr := serverLeftDown.client.GetServer(serverLeftDown.id)
 		if downErr != nil || downServer.Status != pritunl.ServerStatusOnline {
-			return diag.Errorf("server %s is still down after a failed update: start it (or update it) before updating other servers", serverLeftDownId)
+			return diag.Errorf("server %s is still down after a failed update: start it (or update it) before updating other servers", serverLeftDown.id)
 		}
-		serverLeftDownId = ""
+		serverLeftDown.client, serverLeftDown.id = nil, ""
 	}
 
 	// Stop server before applying any change
@@ -1054,11 +1064,11 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 		stopDiags := diag.Errorf("Error on stopping server: %s", err)
 		if shouldServerBeStarted {
 			if startErr := apiClient.StartServer(d.Id()); startErr != nil {
-				serverLeftDownId = d.Id()
+				serverLeftDown.client, serverLeftDown.id = apiClient, d.Id()
 				return append(stopDiags, diag.Errorf("Error on starting the server back after the failed stop: %s", startErr)...)
 			}
 			if confirmErr := confirmServerOnline(ctx, apiClient, d.Id()); confirmErr != nil {
-				serverLeftDownId = d.Id()
+				serverLeftDown.client, serverLeftDown.id = apiClient, d.Id()
 				return append(stopDiags, diag.FromErr(confirmErr)...)
 			}
 		}
@@ -1178,11 +1188,11 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 		// error never leaves the server down.
 		if shouldServerBeStarted {
 			if startErr := apiClient.StartServer(d.Id()); startErr != nil {
-				serverLeftDownId = d.Id()
+				serverLeftDown.client, serverLeftDown.id = apiClient, d.Id()
 				return append(applyDiags, diag.Errorf("Error on starting the server back after the failed update: %s", startErr)...)
 			}
 			if confirmErr := confirmServerOnline(ctx, apiClient, d.Id()); confirmErr != nil {
-				serverLeftDownId = d.Id()
+				serverLeftDown.client, serverLeftDown.id = apiClient, d.Id()
 				return append(applyDiags, diag.FromErr(confirmErr)...)
 			}
 		}
@@ -1192,21 +1202,21 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 	if shouldServerBeStarted {
 		err = apiClient.StartServer(d.Id())
 		if err != nil {
-			serverLeftDownId = d.Id()
+			serverLeftDown.client, serverLeftDown.id = apiClient, d.Id()
 			return diag.Errorf("Error on starting server: %s", err)
 		}
 		if confirmErr := confirmServerOnline(ctx, apiClient, d.Id()); confirmErr != nil {
-			serverLeftDownId = d.Id()
+			serverLeftDown.client, serverLeftDown.id = apiClient, d.Id()
 			return diag.FromErr(confirmErr)
 		}
 	}
 
-	if serverLeftDownId == d.Id() {
+	if retryingDownServer {
 		// the retry either confirmed the server online above or the
 		// configuration keeps it offline on purpose; anything else leaves the
 		// fence up
 		if shouldServerBeStarted || (d.HasChange("status") && d.Get("status").(string) == pritunl.ServerStatusOffline) {
-			serverLeftDownId = ""
+			serverLeftDown.client, serverLeftDown.id = nil, ""
 		}
 	}
 
