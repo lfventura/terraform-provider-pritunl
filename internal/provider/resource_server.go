@@ -1033,10 +1033,11 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 	serverDowntimeMu.Lock()
 	defer serverDowntimeMu.Unlock()
 
-	if serverLeftDownId == d.Id() {
-		// updating the down server itself is the path that brings it back
-		serverLeftDownId = ""
-	} else if serverLeftDownId != "" {
+	// Updating the down server itself is the path that brings it back, so it
+	// passes the fence; the marker only clears further down, once this update
+	// confirms the server online (or the configuration turns it offline on
+	// purpose).
+	if serverLeftDownId != "" && serverLeftDownId != d.Id() {
 		downServer, downErr := apiClient.GetServer(serverLeftDownId)
 		if downErr != nil || downServer.Status != pritunl.ServerStatusOnline {
 			return diag.Errorf("server %s is still down after a failed update: start it (or update it) before updating other servers", serverLeftDownId)
@@ -1197,6 +1198,15 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 		if confirmErr := confirmServerOnline(ctx, apiClient, d.Id()); confirmErr != nil {
 			serverLeftDownId = d.Id()
 			return diag.FromErr(confirmErr)
+		}
+	}
+
+	if serverLeftDownId == d.Id() {
+		// the retry either confirmed the server online above or the
+		// configuration keeps it offline on purpose; anything else leaves the
+		// fence up
+		if shouldServerBeStarted || (d.HasChange("status") && d.Get("status").(string) == pritunl.ServerStatusOffline) {
+			serverLeftDownId = ""
 		}
 	}
 

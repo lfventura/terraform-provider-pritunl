@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 )
 
 type Client interface {
@@ -1282,6 +1283,12 @@ func NewClient(baseUrl, apiToken, apiSecret string, insecure bool) Client {
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure},
 	}
 	httpClient := &http.Client{
+		// Callers hold the process-wide server downtime lock across some of
+		// these calls, so a stalled request must never hold it forever. The
+		// bound sits above Pritunl's slowest known management answer (the
+		// administrator lookup after an out-of-band delete takes over a
+		// minute).
+		Timeout: 120 * time.Second,
 		Transport: &transport{
 			baseUrl:             baseUrl,
 			apiToken:            apiToken,

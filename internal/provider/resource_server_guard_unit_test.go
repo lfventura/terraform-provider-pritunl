@@ -276,3 +276,41 @@ func TestServerUpdateUnconfirmedStartBlocksQueue(t *testing.T) {
 		t.Fatal("srv2 should not have been stopped while srv1 is down")
 	}
 }
+
+// A retry on the down server that ends without a confirmed start keeps the
+// fence up: only a confirmed-online retry (or an explicit offline) releases
+// the queue.
+func TestServerUpdateRetryWithoutStartKeepsQueueBlocked(t *testing.T) {
+	resetDowntimeGuard()
+	shortConfirmWindow(t)
+	apiClient := newGuardClient()
+	apiClient.updateErr = errors.New("simulated api rejection")
+	apiClient.startErr = errors.New("simulated start failure")
+
+	if diags := resourceUpdateServer(context.Background(), guardResourceData(t, "srv1"), pritunl.Client(apiClient)); !diags.HasError() {
+		t.Fatal("the first update should fail and leave srv1 down")
+	}
+
+	// the retry reads srv1 as offline, changes an unrelated attribute and
+	// therefore never starts the server: it must not release the fence
+	apiClient.updateErr = nil
+	apiClient.startErr = nil
+	if diags := resourceUpdateServer(context.Background(), guardResourceData(t, "srv1"), pritunl.Client(apiClient)); diags.HasError() {
+		t.Fatalf("the no-start retry should complete: %v", diags)
+	}
+
+	diags := resourceUpdateServer(context.Background(), guardResourceData(t, "srv2"), pritunl.Client(apiClient))
+	if !diags.HasError() || !strings.Contains(diags[0].Summary, "still down") {
+		t.Fatalf("the queue should stay blocked after a no-start retry, got: %v", diags)
+	}
+	if apiClient.stopped["srv2"] {
+		t.Fatal("srv2 should not have been stopped while srv1 is down")
+	}
+
+	apiClient.mu.Lock()
+	delete(apiClient.stopped, "srv1")
+	apiClient.mu.Unlock()
+	if diags := resourceUpdateServer(context.Background(), guardResourceData(t, "srv2"), pritunl.Client(apiClient)); diags.HasError() {
+		t.Fatalf("the queue should unblock once srv1 is back online: %v", diags)
+	}
+}
