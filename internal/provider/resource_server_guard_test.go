@@ -26,6 +26,7 @@ func guardLabPreCheck(t *testing.T) {
 		t.Skip("set TF_ACC to run the lab guard tests")
 	}
 	preCheck(t)
+	resetDowntimeGuard()
 }
 
 func createLabServer(t *testing.T, name, network string, port int) string {
@@ -42,12 +43,13 @@ func createLabServer(t *testing.T, name, network string, port int) string {
 	})
 
 	server, err := testClient.CreateServer(map[string]interface{}{
-		"name":     name,
-		"protocol": "udp",
-		"cipher":   "aes128",
-		"hash":     "sha1",
-		"port":     port,
-		"network":  network,
+		"name":          name,
+		"dh_param_bits": 2048,
+		"protocol":      "udp",
+		"cipher":        "aes128",
+		"hash":          "sha1",
+		"port":          port,
+		"network":       network,
 	})
 	if err != nil {
 		t.Fatalf("creating the lab server %s: %s", name, err)
@@ -71,7 +73,7 @@ func createLabServer(t *testing.T, name, network string, port int) string {
 func waitLabServerStatus(t *testing.T, id, status string) {
 	t.Helper()
 
-	deadline := time.Now().Add(180 * time.Second)
+	deadline := time.Now().Add(420 * time.Second)
 	for time.Now().Before(deadline) {
 		server, err := testClient.GetServer(id)
 		if err == nil && server.Status == status {

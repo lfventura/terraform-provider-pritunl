@@ -35,7 +35,20 @@ func newGuardClient() *guardClient {
 }
 
 func (c *guardClient) GetServer(id string) (*pritunl.Server, error) {
-	return &pritunl.Server{ID: id, Name: "tfacc-guard", Status: pritunl.ServerStatusOnline}, nil
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	status := pritunl.ServerStatusOnline
+	if c.stopped[id] {
+		status = pritunl.ServerStatusOffline
+	}
+	return &pritunl.Server{ID: id, Name: "tfacc-guard", Status: status}, nil
+}
+
+// resetDowntimeGuard clears the process-wide downtime state between tests.
+func resetDowntimeGuard() {
+	serverDowntimeMu.Lock()
+	serverLeftDownId = ""
+	serverDowntimeMu.Unlock()
 }
 
 func (c *guardClient) StopServer(id string) error {
@@ -92,6 +105,7 @@ func guardResourceData(t *testing.T, id string) *schema.ResourceData {
 // Two concurrent updates never have two servers down at once: the provider
 // serializes the stop→start window, whatever parallelism Terraform runs with.
 func TestServerUpdateDowntimeIsSerialized(t *testing.T) {
+	resetDowntimeGuard()
 	apiClient := newGuardClient()
 	apiClient.updateDelay = 50 * time.Millisecond
 
@@ -121,6 +135,7 @@ func TestServerUpdateDowntimeIsSerialized(t *testing.T) {
 // A failure between the stop and the final start brings the server back up
 // before the error returns, and the original error stays first.
 func TestServerUpdateFailureStartsServerBack(t *testing.T) {
+	resetDowntimeGuard()
 	apiClient := newGuardClient()
 	apiClient.updateErr = errors.New("simulated api rejection")
 
@@ -142,6 +157,7 @@ func TestServerUpdateFailureStartsServerBack(t *testing.T) {
 // A stop whose response is lost after Pritunl already stopped the server gets
 // the recovery start too, with the stop error first.
 func TestServerUpdateStopFailureStartsServerBack(t *testing.T) {
+	resetDowntimeGuard()
 	apiClient := newGuardClient()
 	apiClient.stopErr = errors.New("simulated transport failure")
 
@@ -163,6 +179,7 @@ func TestServerUpdateStopFailureStartsServerBack(t *testing.T) {
 // When the recovery start itself fails, both errors surface and the original
 // one stays first.
 func TestServerUpdateFailureReportsBothErrors(t *testing.T) {
+	resetDowntimeGuard()
 	apiClient := newGuardClient()
 	apiClient.updateErr = errors.New("simulated api rejection")
 	apiClient.startErr = errors.New("simulated start failure")
@@ -176,5 +193,40 @@ func TestServerUpdateFailureReportsBothErrors(t *testing.T) {
 	}
 	if !strings.Contains(diags[len(diags)-1].Summary, "starting the server back") {
 		t.Fatalf("the recovery failure should be reported, got: %s", diags[len(diags)-1].Summary)
+	}
+}
+
+// A server left down by a failed recovery start blocks the queue: the next
+// update refuses to stop another server until the down one is confirmed back
+// online, and unblocks once it is.
+func TestServerUpdateQueueBlocksWhileServerIsLeftDown(t *testing.T) {
+	resetDowntimeGuard()
+	apiClient := newGuardClient()
+	apiClient.updateErr = errors.New("simulated api rejection")
+	apiClient.startErr = errors.New("simulated start failure")
+
+	if diags := resourceUpdateServer(context.Background(), guardResourceData(t, "srv1"), pritunl.Client(apiClient)); !diags.HasError() {
+		t.Fatal("the first update should fail and leave srv1 down")
+	}
+
+	apiClient.updateErr = nil
+	apiClient.startErr = nil
+	diags := resourceUpdateServer(context.Background(), guardResourceData(t, "srv2"), pritunl.Client(apiClient))
+	if !diags.HasError() || !strings.Contains(diags[0].Summary, "still down") {
+		t.Fatalf("the queued update should refuse to run while srv1 is down, got: %v", diags)
+	}
+	if apiClient.stopped["srv2"] {
+		t.Fatal("srv2 should not have been stopped while srv1 is down")
+	}
+	if apiClient.maxStopped != 1 {
+		t.Fatalf("want at most 1 server down at a time, observed %d", apiClient.maxStopped)
+	}
+
+	// the operator starts srv1 from the console: the queue unblocks
+	apiClient.mu.Lock()
+	delete(apiClient.stopped, "srv1")
+	apiClient.mu.Unlock()
+	if diags := resourceUpdateServer(context.Background(), guardResourceData(t, "srv2"), pritunl.Client(apiClient)); diags.HasError() {
+		t.Fatalf("the queue should unblock once srv1 is back online: %v", diags)
 	}
 }

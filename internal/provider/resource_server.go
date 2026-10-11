@@ -16,7 +16,7 @@ import (
 
 func resourceServer() *schema.Resource {
 	return &schema.Resource{
-		Description: "The server resource manages a Pritunl VPN server. Updating a running server stops it, applies the whole change set and starts it again. The stop→start window is serialized across the provider process, so an apply that updates several servers takes down at most one at a time, and a Pritunl API failure inside the window starts the server back before the error returns. The one gap no client-side guard closes is the terraform process itself dying between the stop and the start — for example when the apply runs over the very VPN being updated — which leaves the server stopped until it is started from the console; run applies over a network path that does not depend on the servers being changed.",
+		Description: "The server resource manages a Pritunl VPN server. Updating a running server stops it, applies the whole change set and starts it again. The stop→start window is serialized across the provider process, so an apply that updates several servers takes down at most one at a time, and a Pritunl API failure inside the window starts the server back before the error returns. A server left down by a failed recovery start blocks further updates from stopping another server until it is back online. The one gap no client-side guard closes is the terraform process itself dying between the stop and the start — for example when the apply runs over the very VPN being updated — which leaves the server stopped until it is started from the console; run applies over a network path that does not depend on the servers being changed.",
 		Schema: map[string]*schema.Schema{
 			"name": {
 				Type:        schema.TypeString,
@@ -796,10 +796,16 @@ func resourceCreateServer(ctx context.Context, d *schema.ResourceData, meta inte
 }
 
 // serverDowntimeMu serializes the stop→start window of every server update in
-// this provider process: at most one server is down at a time, whatever
-// parallelism Terraform runs resource updates with, so an update sweep never
-// takes the whole VPN fleet offline at once.
-var serverDowntimeMu sync.Mutex
+// this process: at most one server is down at a time, whatever parallelism
+// Terraform runs resource updates with, so an update sweep never takes the
+// whole VPN fleet offline at once. serverLeftDownId remembers a server whose
+// recovery start failed; while it is not confirmed back online, queued updates
+// refuse to stop another server instead of widening the outage. Both are
+// guarded by the mutex.
+var (
+	serverDowntimeMu sync.Mutex
+	serverLeftDownId string
+)
 
 func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	apiClient := meta.(pritunl.Client)
@@ -996,6 +1002,17 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 	serverDowntimeMu.Lock()
 	defer serverDowntimeMu.Unlock()
 
+	if serverLeftDownId == d.Id() {
+		// updating the down server itself is the path that brings it back
+		serverLeftDownId = ""
+	} else if serverLeftDownId != "" {
+		downServer, downErr := apiClient.GetServer(serverLeftDownId)
+		if downErr != nil || downServer.Status != pritunl.ServerStatusOnline {
+			return diag.Errorf("server %s is still down after a failed update: start it (or update it) before updating other servers", serverLeftDownId)
+		}
+		serverLeftDownId = ""
+	}
+
 	// Stop server before applying any change
 	err = apiClient.StopServer(d.Id())
 	if err != nil {
@@ -1005,6 +1022,7 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 		stopDiags := diag.Errorf("Error on stopping server: %s", err)
 		if shouldServerBeStarted {
 			if startErr := apiClient.StartServer(d.Id()); startErr != nil {
+				serverLeftDownId = d.Id()
 				return append(stopDiags, diag.Errorf("Error on starting the server back after the failed stop: %s", startErr)...)
 			}
 		}
@@ -1015,19 +1033,23 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 		if d.HasChange("organization_ids") {
 			oldOrgs, newOrgs := d.GetChange("organization_ids")
 
-			oldOrgsOnly := diffStringLists(oldOrgs.([]interface{}), newOrgs.([]interface{}))
-			for _, v := range oldOrgsOnly {
-				err = apiClient.DetachOrganizationFromServer(v, d.Id())
-				if err != nil {
-					return diag.Errorf("Error on detaching server to the organization: %s", err)
-				}
-			}
-
+			// Additions run first: Pritunl refuses to start a server with no
+			// organization, so the old ones stay attached until every
+			// replacement has landed and an attach failure still leaves a
+			// startable server.
 			newOrgsOnly := diffStringLists(newOrgs.([]interface{}), oldOrgs.([]interface{}))
 			for _, v := range newOrgsOnly {
 				err = apiClient.AttachOrganizationToServer(v, d.Id())
 				if err != nil {
 					return diag.Errorf("Error on attaching server to the organization: %s", err)
+				}
+			}
+
+			oldOrgsOnly := diffStringLists(oldOrgs.([]interface{}), newOrgs.([]interface{}))
+			for _, v := range oldOrgsOnly {
+				err = apiClient.DetachOrganizationFromServer(v, d.Id())
+				if err != nil {
+					return diag.Errorf("Error on detaching server to the organization: %s", err)
 				}
 			}
 		}
@@ -1120,6 +1142,7 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 		// error never leaves the server down.
 		if shouldServerBeStarted {
 			if startErr := apiClient.StartServer(d.Id()); startErr != nil {
+				serverLeftDownId = d.Id()
 				return append(applyDiags, diag.Errorf("Error on starting the server back after the failed update: %s", startErr)...)
 			}
 		}
@@ -1129,6 +1152,7 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 	if shouldServerBeStarted {
 		err = apiClient.StartServer(d.Id())
 		if err != nil {
+			serverLeftDownId = d.Id()
 			return diag.Errorf("Error on starting server: %s", err)
 		}
 	}
