@@ -3,12 +3,12 @@
 page_title: "pritunl_server Resource - terraform-provider-pritunl"
 subcategory: ""
 description: |-
-  The organization resource allows managing information about a particular Pritunl server.
+  The server resource manages a Pritunl VPN server. Updating a running server stops it, applies the whole change set and starts it again. The stop→start window is serialized across the provider process, so an apply that updates several servers takes down at most one at a time, and a Pritunl API failure inside the window starts the server back before the error returns. The one gap no client-side guard closes is the terraform process itself dying between the stop and the start — for example when the apply runs over the very VPN being updated — which leaves the server stopped until it is started from the console; run applies over a network path that does not depend on the servers being changed.
 ---
 
 # pritunl_server (Resource)
 
-The organization resource allows managing information about a particular Pritunl server.
+The server resource manages a Pritunl VPN server. Updating a running server stops it, applies the whole change set and starts it again. The stop→start window is serialized across the provider process, so an apply that updates several servers takes down at most one at a time, and a Pritunl API failure inside the window starts the server back before the error returns. The one gap no client-side guard closes is the terraform process itself dying between the stop and the start — for example when the apply runs over the very VPN being updated — which leaves the server stopped until it is started from the console; run applies over a network path that does not depend on the servers being changed.
 
 
 

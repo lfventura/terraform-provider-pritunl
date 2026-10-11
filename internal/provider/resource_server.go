@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 
 	"github.com/hashicorp/go-cty/cty"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
@@ -15,7 +16,7 @@ import (
 
 func resourceServer() *schema.Resource {
 	return &schema.Resource{
-		Description: "The organization resource allows managing information about a particular Pritunl server.",
+		Description: "The server resource manages a Pritunl VPN server. Updating a running server stops it, applies the whole change set and starts it again. The stop→start window is serialized across the provider process, so an apply that updates several servers takes down at most one at a time, and a Pritunl API failure inside the window starts the server back before the error returns. The one gap no client-side guard closes is the terraform process itself dying between the stop and the start — for example when the apply runs over the very VPN being updated — which leaves the server stopped until it is started from the console; run applies over a network path that does not depend on the servers being changed.",
 		Schema: map[string]*schema.Schema{
 			"name": {
 				Type:        schema.TypeString,
@@ -794,6 +795,12 @@ func resourceCreateServer(ctx context.Context, d *schema.ResourceData, meta inte
 	return resourceReadServer(ctx, d, meta)
 }
 
+// serverDowntimeMu serializes the stop→start window of every server update in
+// this provider process: at most one server is down at a time, whatever
+// parallelism Terraform runs resource updates with, so an update sweep never
+// takes the whole VPN fleet offline at once.
+var serverDowntimeMu sync.Mutex
+
 func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	apiClient := meta.(pritunl.Client)
 
@@ -983,114 +990,131 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 		server.DnsServers = dnsServers
 	}
 
+	// Start server if it was ONLINE before and status wasn't changed OR status was changed to ONLINE
+	shouldServerBeStarted := (prevServerStatus == pritunl.ServerStatusOnline && !d.HasChange("status")) || (d.HasChange("status") && d.Get("status").(string) != pritunl.ServerStatusOffline)
+
+	serverDowntimeMu.Lock()
+	defer serverDowntimeMu.Unlock()
+
 	// Stop server before applying any change
 	err = apiClient.StopServer(d.Id())
 	if err != nil {
 		return diag.Errorf("Error on stopping server: %s", err)
 	}
 
-	if d.HasChange("organization_ids") {
-		oldOrgs, newOrgs := d.GetChange("organization_ids")
+	applyDiags := func() diag.Diagnostics {
+		if d.HasChange("organization_ids") {
+			oldOrgs, newOrgs := d.GetChange("organization_ids")
 
-		oldOrgsOnly := diffStringLists(oldOrgs.([]interface{}), newOrgs.([]interface{}))
-		for _, v := range oldOrgsOnly {
-			err = apiClient.DetachOrganizationFromServer(v, d.Id())
-			if err != nil {
-				return diag.Errorf("Error on detaching server to the organization: %s", err)
+			oldOrgsOnly := diffStringLists(oldOrgs.([]interface{}), newOrgs.([]interface{}))
+			for _, v := range oldOrgsOnly {
+				err = apiClient.DetachOrganizationFromServer(v, d.Id())
+				if err != nil {
+					return diag.Errorf("Error on detaching server to the organization: %s", err)
+				}
+			}
+
+			newOrgsOnly := diffStringLists(newOrgs.([]interface{}), oldOrgs.([]interface{}))
+			for _, v := range newOrgsOnly {
+				err = apiClient.AttachOrganizationToServer(v, d.Id())
+				if err != nil {
+					return diag.Errorf("Error on attaching server to the organization: %s", err)
+				}
 			}
 		}
 
-		newOrgsOnly := diffStringLists(newOrgs.([]interface{}), oldOrgs.([]interface{}))
-		for _, v := range newOrgsOnly {
-			err = apiClient.AttachOrganizationToServer(v, d.Id())
+		if d.HasChange("route") {
+			oldRoutes, newRoutes := d.GetChange("route")
+
+			newRoutesMap := make(map[string]pritunl.Route)
+			for _, v := range newRoutes.([]interface{}) {
+				route := pritunl.ConvertMapToRoute(v.(map[string]interface{}))
+				newRoutesMap[route.Network] = route
+			}
+			oldRoutesMap := make(map[string]pritunl.Route)
+			for _, v := range oldRoutes.([]interface{}) {
+				route := pritunl.ConvertMapToRoute(v.(map[string]interface{}))
+				oldRoutesMap[route.Network] = route
+			}
+
+			declaredRoutes := make([]pritunl.Route, 0, len(newRoutesMap))
+			for _, route := range newRoutesMap {
+				declaredRoutes = append(declaredRoutes, route)
+			}
+			if err := validateDefaultRoutePair(declaredRoutes); err != nil {
+				return diag.FromErr(err)
+			}
+
+			// Deletions run first: Pritunl cascades some of them (removing
+			// 0.0.0.0/0 also removes its ::/0 companion), so a route added or
+			// updated before a cascading delete would be lost.
+			for network, oldRoute := range oldRoutesMap {
+				if _, found := newRoutesMap[network]; !found {
+					// delete route
+					err = apiClient.DeleteRouteFromServer(d.Id(), oldRoute)
+					if err != nil {
+						return diag.Errorf("Error on deleting route from the server: %s", err)
+					}
+				}
+			}
+
+			for network, newRoute := range newRoutesMap {
+				if oldRoute, found := oldRoutesMap[network]; found {
+					// update if something changed or skip
+					if oldRoute.Nat != newRoute.Nat || oldRoute.NetGateway != newRoute.NetGateway || oldRoute.Comment != newRoute.Comment {
+						err = apiClient.UpdateRouteOnServer(d.Id(), newRoute)
+						if err != nil {
+							return diag.Errorf("Error on updating route on the server: %s", err)
+						}
+					}
+				} else {
+					// add route
+					err = apiClient.AddRouteToServer(d.Id(), newRoute)
+					if err != nil {
+						return diag.Errorf("Error on adding route to the server: %s", err)
+					}
+				}
+			}
+
+			err = reconcileServerRoutes(apiClient, d.Id(), declaredRoutes)
 			if err != nil {
-				return diag.Errorf("Error on attaching server to the organization: %s", err)
+				return diag.Errorf("Error on reconciling routes on the server: %s", err)
 			}
 		}
-	}
 
-	if d.HasChange("route") {
-		oldRoutes, newRoutes := d.GetChange("route")
+		if d.HasChange("host_ids") {
+			oldHosts, newHosts := d.GetChange("host_ids")
+			for _, v := range oldHosts.([]interface{}) {
+				err = apiClient.DetachHostFromServer(v.(string), d.Id())
+				if err != nil {
+					return diag.Errorf("Error on detaching server to the organization: %s", err)
+				}
+			}
+			for _, v := range newHosts.([]interface{}) {
+				err = apiClient.AttachHostToServer(v.(string), d.Id())
+				if err != nil {
+					return diag.Errorf("Error on attaching server to the organization: %s", err)
+				}
+			}
+		}
 
-		newRoutesMap := make(map[string]pritunl.Route)
-		for _, v := range newRoutes.([]interface{}) {
-			route := pritunl.ConvertMapToRoute(v.(map[string]interface{}))
-			newRoutesMap[route.Network] = route
-		}
-		oldRoutesMap := make(map[string]pritunl.Route)
-		for _, v := range oldRoutes.([]interface{}) {
-			route := pritunl.ConvertMapToRoute(v.(map[string]interface{}))
-			oldRoutesMap[route.Network] = route
-		}
-
-		declaredRoutes := make([]pritunl.Route, 0, len(newRoutesMap))
-		for _, route := range newRoutesMap {
-			declaredRoutes = append(declaredRoutes, route)
-		}
-		if err := validateDefaultRoutePair(declaredRoutes); err != nil {
+		if err := apiClient.UpdateServer(d.Id(), server); err != nil {
 			return diag.FromErr(err)
 		}
 
-		// Deletions run first: Pritunl cascades some of them (removing
-		// 0.0.0.0/0 also removes its ::/0 companion), so a route added or
-		// updated before a cascading delete would be lost.
-		for network, oldRoute := range oldRoutesMap {
-			if _, found := newRoutesMap[network]; !found {
-				// delete route
-				err = apiClient.DeleteRouteFromServer(d.Id(), oldRoute)
-				if err != nil {
-					return diag.Errorf("Error on deleting route from the server: %s", err)
-				}
+		return nil
+	}()
+
+	if applyDiags != nil {
+		// The server stopped for this update: the original failure is handed
+		// back only after trying to bring the server up again, so an API-side
+		// error never leaves the server down.
+		if shouldServerBeStarted {
+			if startErr := apiClient.StartServer(d.Id()); startErr != nil {
+				return append(applyDiags, diag.Errorf("Error on starting the server back after the failed update: %s", startErr)...)
 			}
 		}
-
-		for network, newRoute := range newRoutesMap {
-			if oldRoute, found := oldRoutesMap[network]; found {
-				// update if something changed or skip
-				if oldRoute.Nat != newRoute.Nat || oldRoute.NetGateway != newRoute.NetGateway || oldRoute.Comment != newRoute.Comment {
-					err = apiClient.UpdateRouteOnServer(d.Id(), newRoute)
-					if err != nil {
-						return diag.Errorf("Error on updating route on the server: %s", err)
-					}
-				}
-			} else {
-				// add route
-				err = apiClient.AddRouteToServer(d.Id(), newRoute)
-				if err != nil {
-					return diag.Errorf("Error on adding route to the server: %s", err)
-				}
-			}
-		}
-
-		err = reconcileServerRoutes(apiClient, d.Id(), declaredRoutes)
-		if err != nil {
-			return diag.Errorf("Error on reconciling routes on the server: %s", err)
-		}
-	}
-
-	if d.HasChange("host_ids") {
-		oldHosts, newHosts := d.GetChange("host_ids")
-		for _, v := range oldHosts.([]interface{}) {
-			err = apiClient.DetachHostFromServer(v.(string), d.Id())
-			if err != nil {
-				return diag.Errorf("Error on detaching server to the organization: %s", err)
-			}
-		}
-		for _, v := range newHosts.([]interface{}) {
-			err = apiClient.AttachHostToServer(v.(string), d.Id())
-			if err != nil {
-				return diag.Errorf("Error on attaching server to the organization: %s", err)
-			}
-		}
-	}
-
-	// Start server if it was ONLINE before and status wasn't changed OR status was changed to ONLINE
-	shouldServerBeStarted := (prevServerStatus == pritunl.ServerStatusOnline && !d.HasChange("status")) || (d.HasChange("status") && d.Get("status").(string) != pritunl.ServerStatusOffline)
-
-	err = apiClient.UpdateServer(d.Id(), server)
-	if err != nil {
-		// start server in case of error?
-		return diag.FromErr(err)
+		return applyDiags
 	}
 
 	if shouldServerBeStarted {
