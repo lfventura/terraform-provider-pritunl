@@ -17,7 +17,7 @@ import (
 
 func resourceServer() *schema.Resource {
 	return &schema.Resource{
-		Description: "The server resource manages a Pritunl VPN server. Updating a running server stops it, applies the whole change set and starts it again. The stop→start window is serialized across the provider process, so an apply that updates several servers takes down at most one at a time, and a Pritunl API failure inside the window starts the server back before the error returns. The final start only counts once the server reports online again, and a server left down by a failed recovery blocks the remaining updates of the same apply (the provider process) from stopping another server until it is back online; across provider runs the marker starts clean, so a server left down is started from the console. The one gap no client-side guard closes is the terraform process itself dying between the stop and the start — for example when the apply runs over the very VPN being updated — which leaves the server stopped until it is started from the console; run applies over a network path that does not depend on the servers being changed.",
+		Description: "The server resource manages a Pritunl VPN server. An update confined to the hot arguments — name, pre_connect_msg and replica_count, the ones Pritunl applies to a running server — is one online request with no stop. If Pritunl refuses that request because live drift touches a stopped-only field, the update falls back to the guarded stop→start window described below. Any other update stops the server, applies the whole change set and starts it again. The stop→start window is serialized across the provider process, so an apply that updates several servers takes down at most one at a time, and a Pritunl API failure inside the window starts the server back before the error returns. The final start only counts once the server reports online again, and a server left down by a failed recovery blocks the remaining updates of the same apply (the provider process) from stopping another server until it is back online; across provider runs the marker starts clean, so a server left down is started from the console. The one gap no client-side guard closes is the terraform process itself dying between the stop and the start — for example when the apply runs over the very VPN being updated — which leaves the server stopped until it is started from the console; run applies over a network path that does not depend on the servers being changed.",
 		Schema: map[string]*schema.Schema{
 			"name": {
 				Type:        schema.TypeString,
@@ -816,6 +816,30 @@ var (
 	}
 )
 
+// serverHotUpdateAttributes are the arguments Pritunl applies to an online
+// server — its PUT handler keeps allow_online for them — so an update
+// confined to them needs no stop→start window at all. Every other setting,
+// the routes and the organizations need the server offline, and a status
+// change is the stop or start itself; the hosts attach and detach while the
+// server runs, but they stay outside this list and keep the guarded window.
+var serverHotUpdateAttributes = []string{"name", "pre_connect_msg", "replica_count"}
+
+// serverUpdateIsHotOnly reports whether the update touches hot-apply
+// arguments and nothing else. An empty diff stays on the guarded path, and so
+// does anything mixing a hot argument with a stopped-only one: the guarded
+// window then carries the whole document. A package variable so the tests
+// drive both paths.
+var serverUpdateIsHotOnly = func(d *schema.ResourceData) bool {
+	anyHot := false
+	for _, key := range serverHotUpdateAttributes {
+		if d.HasChange(key) {
+			anyHot = true
+			break
+		}
+	}
+	return anyHot && !d.HasChangesExcept(serverHotUpdateAttributes...)
+}
+
 // confirmServerOnline holds the caller inside the downtime window until the
 // started server actually reports online: a 200 on the start request only
 // queues the startup, and the one-server-down invariant is about
@@ -977,6 +1001,8 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 
 	if d.HasChange("pre_connect_msg") {
 		server.PreConnectMsg = d.Get("pre_connect_msg").(string)
+		// an emptied message is an explicit clear, not an absent field
+		server.ClearPreConnectMsg = server.PreConnectMsg == ""
 	}
 
 	if d.HasChange("allowed_devices") {
@@ -1033,6 +1059,23 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 			dnsServers = append(dnsServers, v.(string))
 		}
 		server.DnsServers = dnsServers
+	}
+
+	// Pritunl applies the hot arguments to an online server, so an update
+	// confined to them skips the stop→start window entirely: no downtime and
+	// no client-dependent gap — the single PUT either lands whole or not at
+	// all. A server_not_offline answer means the full document is converging
+	// live drift on a stopped-only field; the update then falls back to the
+	// guarded window below. The fence is not consulted here because this path
+	// never stops a server.
+	if serverUpdateIsHotOnly(d) {
+		err = apiClient.UpdateServer(d.Id(), server)
+		if err == nil {
+			return resourceReadServer(ctx, d, meta)
+		}
+		if !strings.Contains(err.Error(), "server_not_offline") {
+			return diag.FromErr(err)
+		}
 	}
 
 	// Start server if it was ONLINE before and status wasn't changed OR status was changed to ONLINE

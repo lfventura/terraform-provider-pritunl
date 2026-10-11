@@ -62,16 +62,29 @@ type Server struct {
 	Debug            bool     `json:"debug,omitempty"`
 	GeoSort          bool     `json:"geo_sort,omitempty"`
 	Status           string   `json:"status,omitempty"`
+
+	// ClearPreConnectMsg makes an empty PreConnectMsg travel as an explicit
+	// "" instead of being dropped by omitempty, so an update can clear it.
+	ClearPreConnectMsg bool `json:"-"`
 }
 
 func (s *Server) MarshalJSON() ([]byte, error) {
 	type Alias Server
+	// The shallower field shadows the Alias one even when omitted, so the
+	// value is always carried here: non-empty as usual, empty only when the
+	// caller asked for an explicit clear.
+	var preConnectMsg *string
+	if s.PreConnectMsg != "" || s.ClearPreConnectMsg {
+		preConnectMsg = &s.PreConnectMsg
+	}
 	return json.Marshal(&struct {
 		// Pritunl API expects input mss_fix value as a string, but returns as an int
-		MssFix string `json:"mss_fix"`
+		MssFix        string  `json:"mss_fix"`
+		PreConnectMsg *string `json:"pre_connect_msg,omitempty"`
 		*Alias
 	}{
-		MssFix: strconv.Itoa(s.MssFix),
-		Alias:  (*Alias)(s),
+		MssFix:        strconv.Itoa(s.MssFix),
+		PreConnectMsg: preConnectMsg,
+		Alias:         (*Alias)(s),
 	})
 }

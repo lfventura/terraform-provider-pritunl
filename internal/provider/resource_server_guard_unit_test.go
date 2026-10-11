@@ -26,9 +26,14 @@ type guardClient struct {
 	updateDelay time.Duration
 	stopErr     error
 	updateErr   error
-	startErr    error
-	startSilent bool
-	startCalls  []string
+	// updateErrOnce fails only the first UpdateServer call, so a test can
+	// watch the hot path fall back to the guarded window and succeed there.
+	updateErrOnce error
+	startErr      error
+	startSilent   bool
+	startCalls    []string
+	updateCalls   int
+	updated       []*pritunl.Server
 }
 
 func newGuardClient() *guardClient {
@@ -97,6 +102,15 @@ func (c *guardClient) StartServer(id string) error {
 
 func (c *guardClient) UpdateServer(id string, server *pritunl.Server) error {
 	time.Sleep(c.updateDelay)
+	c.mu.Lock()
+	c.updateCalls++
+	c.updated = append(c.updated, server)
+	once := c.updateErrOnce
+	c.updateErrOnce = nil
+	c.mu.Unlock()
+	if once != nil {
+		return once
+	}
 	return c.updateErr
 }
 
