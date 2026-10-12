@@ -56,6 +56,29 @@ func (s Settings) Int(key string) int {
 	return 0
 }
 
+// AuditingAll is the value of the auditing setting while auditing is on. It is
+// the only value Pritunl knows besides null, which is auditing off.
+const AuditingAll = "all"
+
+// Auditing reports whether auditing is on: the setting holds "all" while it is
+// and null while it is not.
+func (s Settings) Auditing() bool {
+	return s.String("auditing") == AuditingAll
+}
+
+// SetAuditing turns auditing on with "all" or off with null, the two values
+// Pritunl stores for it. Pritunl refuses to turn auditing off once it is on,
+// answering a PUT /settings that tries with a 400 cannot_disable_auditing.
+func (s Settings) SetAuditing(on bool) {
+	if on {
+		s["auditing"] = AuditingAll
+
+		return
+	}
+
+	s["auditing"] = nil
+}
+
 // normalize makes a settings object read from the API acceptable as a request
 // body again.
 //

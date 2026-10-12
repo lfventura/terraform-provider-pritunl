@@ -1,10 +1,14 @@
 package provider
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	"github.com/hashicorp/go-cty/cty"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	"github.com/lfventura/terraform-provider-pritunl/internal/pritunl"
 )
 
 func TestNormalizeSAMLCert(t *testing.T) {
@@ -167,5 +171,195 @@ func TestSsoValidateFunc(t *testing.T) {
 		if _, errs := validate(value, "sso"); len(errs) == 0 {
 			t.Fatalf("sso accepts %q, want a validation error", value)
 		}
+	}
+}
+
+func TestValidateAuditingRawConfig(t *testing.T) {
+	config := func(auditing cty.Value) cty.Value {
+		return cty.ObjectVal(map[string]cty.Value{"auditing": auditing})
+	}
+
+	cases := map[string]struct {
+		enabled bool
+		config  cty.Value
+		wantErr bool
+	}{
+		"on to off is refused":             {enabled: true, config: config(cty.False), wantErr: true},
+		"on stays on":                      {enabled: true, config: config(cty.True)},
+		"on and unset keeps it as it is":   {enabled: true, config: config(cty.NullVal(cty.Bool))},
+		"on and unknown is left alone":     {enabled: true, config: config(cty.UnknownVal(cty.Bool))},
+		"off to on":                        {enabled: false, config: config(cty.True)},
+		"off stays off":                    {enabled: false, config: config(cty.False)},
+		"off and unset keeps it as it is":  {enabled: false, config: config(cty.NullVal(cty.Bool))},
+		"a null configuration is not read": {enabled: true, config: cty.NullVal(cty.Object(map[string]cty.Type{"auditing": cty.Bool}))},
+	}
+
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := validateAuditingRawConfig(c.enabled, c.config)
+			if c.wantErr && err == nil {
+				t.Fatal("validateAuditingRawConfig: want an error, got none")
+			}
+			if c.wantErr && !strings.Contains(err.Error(), "auditing") {
+				t.Fatalf("validateAuditingRawConfig: the error %q does not name auditing", err)
+			}
+			if !c.wantErr && err != nil {
+				t.Fatalf("validateAuditingRawConfig: unexpected error %q", err)
+			}
+		})
+	}
+}
+
+// settingsResourceData builds the resource data of a pritunl_settings being
+// planned from the given configuration, with the raw configuration the
+// overlay reads attached the way the plugin server attaches it: every
+// attribute the configuration does not mention is null.
+func settingsResourceData(t *testing.T, raw map[string]interface{}, rawConfig map[string]cty.Value) *schema.ResourceData {
+	t.Helper()
+
+	resource := resourceSettings()
+	sm := schema.InternalMap(resource.Schema)
+
+	values := map[string]cty.Value{}
+	for key, attribute := range sm.CoreConfigSchema().Attributes {
+		values[key] = cty.NullVal(attribute.Type)
+	}
+	values["id"] = cty.NullVal(cty.String)
+	for key, value := range rawConfig {
+		values[key] = value
+	}
+
+	diff, err := sm.Diff(context.Background(), nil, terraform.NewResourceConfigRaw(raw), nil, nil, true)
+	if err != nil {
+		t.Fatalf("failed to plan the configuration: %s", err)
+	}
+	diff.RawConfig = cty.ObjectVal(values)
+
+	data, err := sm.Data(nil, diff)
+	if err != nil {
+		t.Fatalf("failed to build the resource data: %s", err)
+	}
+
+	return data
+}
+
+func TestOverlaySettingsAuditing(t *testing.T) {
+	cases := map[string]struct {
+		instance  interface{}
+		raw       map[string]interface{}
+		rawConfig map[string]cty.Value
+		want      interface{}
+	}{
+		"true turns it on": {
+			instance:  nil,
+			raw:       map[string]interface{}{"auditing": true},
+			rawConfig: map[string]cty.Value{"auditing": cty.True},
+			want:      pritunl.AuditingAll,
+		},
+		"true keeps it on": {
+			instance:  pritunl.AuditingAll,
+			raw:       map[string]interface{}{"auditing": true},
+			rawConfig: map[string]cty.Value{"auditing": cty.True},
+			want:      pritunl.AuditingAll,
+		},
+		"false keeps it off as null": {
+			instance:  nil,
+			raw:       map[string]interface{}{"auditing": false},
+			rawConfig: map[string]cty.Value{"auditing": cty.False},
+			want:      nil,
+		},
+		"unset hands an instance that is on back untouched": {
+			instance:  pritunl.AuditingAll,
+			raw:       map[string]interface{}{"pin_mode": "required"},
+			rawConfig: map[string]cty.Value{"pin_mode": cty.StringVal("required")},
+			want:      pritunl.AuditingAll,
+		},
+		"unset hands an instance that is off back untouched": {
+			instance:  nil,
+			raw:       map[string]interface{}{"pin_mode": "required"},
+			rawConfig: map[string]cty.Value{"pin_mode": cty.StringVal("required")},
+			want:      nil,
+		},
+	}
+
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			d := settingsResourceData(t, c.raw, c.rawConfig)
+			settings := pritunl.Settings{"auditing": c.instance}
+
+			overlaySettings(d, settings)
+
+			if got := settings["auditing"]; got != c.want {
+				t.Fatalf("auditing after the overlay: got %#v, want %#v", got, c.want)
+			}
+		})
+	}
+}
+
+// planSettings plans the given configuration against a pritunl_settings
+// state through the resource's own CustomizeDiff, the way the plugin server
+// plans it: the raw configuration carries every attribute of the schema, null
+// where the configuration does not mention it, and rides on the prior state.
+func planSettings(t *testing.T, state map[string]string, rawConfig map[string]cty.Value) error {
+	t.Helper()
+
+	resource := resourceSettings()
+	coreSchema := resource.CoreConfigSchema()
+
+	values := map[string]cty.Value{}
+	for key, attribute := range coreSchema.Attributes {
+		values[key] = cty.NullVal(attribute.Type)
+	}
+	for key, value := range rawConfig {
+		values[key] = value
+	}
+
+	configVal := cty.ObjectVal(values)
+	config := terraform.NewResourceConfigShimmed(configVal, coreSchema)
+	instance := &terraform.InstanceState{ID: "settings", Attributes: state, RawConfig: configVal}
+
+	_, err := schema.InternalMap(resource.Schema).Diff(context.Background(), instance, config, resource.CustomizeDiff, nil, true)
+
+	return err
+}
+
+func TestCustomizeSettingsDiffAuditing(t *testing.T) {
+	cases := map[string]struct {
+		state     map[string]string
+		rawConfig map[string]cty.Value
+		wantErr   bool
+	}{
+		"on to off fails the plan": {
+			state:     map[string]string{"id": "settings", "auditing": "true"},
+			rawConfig: map[string]cty.Value{"auditing": cty.False},
+			wantErr:   true,
+		},
+		"off to on is planned": {
+			state:     map[string]string{"id": "settings", "auditing": "false"},
+			rawConfig: map[string]cty.Value{"auditing": cty.True},
+		},
+		"on and unset is planned": {
+			state:     map[string]string{"id": "settings", "auditing": "true"},
+			rawConfig: map[string]cty.Value{"pin_mode": cty.StringVal("required")},
+		},
+		"on stays on": {
+			state:     map[string]string{"id": "settings", "auditing": "true"},
+			rawConfig: map[string]cty.Value{"auditing": cty.True},
+		},
+	}
+
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := planSettings(t, c.state, c.rawConfig)
+			if c.wantErr && err == nil {
+				t.Fatal("plan: want an error, got none")
+			}
+			if c.wantErr && !strings.Contains(err.Error(), "auditing") {
+				t.Fatalf("plan: the error %q does not name auditing", err)
+			}
+			if !c.wantErr && err != nil {
+				t.Fatalf("plan: unexpected error %q", err)
+			}
+		})
 	}
 }

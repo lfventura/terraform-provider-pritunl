@@ -134,6 +134,11 @@ resource "pritunl_settings" "toggles" {
   restrict_import  = true
   client_reconnect = true
 
+  # A one-way switch: Pritunl never lets auditing be turned off once it is
+  # on, so false is refused at plan time on an instance where it is on.
+  # Changing it requires a super user administrator.
+  auditing = true
+
   # The two authentication caches are two different settings with deceptively
   # similar names, and both are managed here:
   #
@@ -210,6 +215,7 @@ resource "pritunl_settings" "sso" {
 
 ### Optional
 
+- `auditing` (Boolean) Whether the instance keeps an audit log of the administrator and user actions, the `all` value of the `auditing` setting that `pritunl set app.auditing all` sets from the command line. It is a one-way switch: Pritunl never lets auditing be turned off once it is on and answers any attempt with a `400 cannot_disable_auditing`, so `false` is only accepted while auditing is still off, and configuring `false` on an instance where it is on fails the plan. Changing it requires the administrator of the provider credentials to be a super user, Pritunl answers anyone else with a `400 requires_super_user`. Destroying the resource leaves auditing as it is. Defaults to the value already configured on the instance.
 - `client_reconnect` (Boolean) Whether the Pritunl client reconnects on its own once a connection drops. The web console only shows the toggle while single sign-on is enabled, but that is a detail of the console: `PUT /settings` takes the setting either way, and so does this resource, which never ties it to `sso`.
 - `ipv6` (Boolean) Whether the VPN servers of the instance accept IPv6 connections next to IPv4 ones. Defaults to the value already configured on the instance.
 - `pin_mode` (String) How the PIN of a user is treated during the secondary authentication, one of `optional`, `required` or `disabled`, the three modes the web console offers. `required` refuses the users that have no PIN set, `disabled` ignores the PINs that are already set. Defaults to the mode already configured on the instance.
