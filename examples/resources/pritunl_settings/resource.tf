@@ -183,8 +183,9 @@ resource "pritunl_settings" "main" {
 #   sso = "disabled"
 # }
 #
-# `server_sso_url`, `sso_saml_url` and `sso_saml_issuer_url` are normalised by
-# recent Pritunl versions, which add the `https://` scheme when the value
-# carries none and lowercase the host, so they are best configured already
-# normalised: a value Pritunl rewrites reads back differently from the
-# configured one and leaves a plan that never settles.
+# `sso_saml_url` and `sso_saml_issuer_url` are normalised by Pritunl, which
+# adds the `https://` scheme when the value carries none and lowercases the
+# host, so they are best configured already normalised: a value Pritunl
+# rewrites reads back differently from the configured one and leaves a plan
+# that never settles. `server_sso_url` set to a host alone is compared by
+# host, so both `vpn.example.com` and `https://vpn.example.com` settle.
