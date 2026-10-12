@@ -79,6 +79,6 @@ Required:
 
 Optional:
 
-- `comment` (String) Comment for route
+- `comment` (String) Comment for route. Pritunl 1.34.4763 and later store it filtered down to letters, digits and `-=_@.:/!#$&*+?^|~`, dropping spaces, commas and parentheses; a comment that differs from the stored one only by those characters is not a change.
 - `nat` (Boolean) NAT vpn traffic destined to this network
 - `net_gateway` (Boolean) Net Gateway vpn traffic destined to this network

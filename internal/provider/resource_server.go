@@ -446,10 +446,11 @@ func resourceServer() *schema.Resource {
 							},
 						},
 						"comment": {
-							Type:        schema.TypeString,
-							Required:    false,
-							Optional:    true,
-							Description: "Comment for route",
+							Type:             schema.TypeString,
+							Required:         false,
+							Optional:         true,
+							DiffSuppressFunc: suppressRouteCommentDiff,
+							Description:      "Comment for route. Pritunl 1.34.4763 and later store it filtered down to letters, digits and `-=_@.:/!#$&*+?^|~`, dropping spaces, commas and parentheses; a comment that differs from the stored one only by those characters is not a change.",
 						},
 						"nat": {
 							Type:        schema.TypeBool,
