@@ -120,6 +120,11 @@ resource "pritunl_settings" "main" {
 #   restrict_import  = true
 #   client_reconnect = true
 #
+#   # A one-way switch: Pritunl never lets auditing be turned off once it is
+#   # on, so false is refused at plan time on an instance where it is on.
+#   # Changing it requires a super user administrator.
+#   auditing = true
+#
 #   # The two authentication caches are two different settings with deceptively
 #   # similar names, and both are managed here:
 #   #

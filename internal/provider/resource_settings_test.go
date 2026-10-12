@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -951,4 +952,47 @@ func testAccCheckSettingsAttributes(values map[string]interface{}) resource.Test
 	}
 
 	return resource.ComposeTestCheckFunc(checks...)
+}
+
+// Pritunl never lets auditing be turned off once it is on, so this test leaves
+// it on in the test instance for the rest of the suite; the other tests write
+// the settings back as they read them and never depend on it.
+func TestAccPritunlSettingsAuditing(t *testing.T) {
+	if os.Getenv("PRITUNL_SKIP_SETTINGS_ACC_TEST") != "" {
+		t.Skip("PRITUNL_SKIP_SETTINGS_ACC_TEST is set, skipping the pritunl_settings acceptance test")
+	}
+
+	if os.Getenv("TF_ACC") == "" {
+		t.Skip("TF_ACC is not set, skipping the acceptance test")
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:          func() { preCheck(t) },
+		ProviderFactories: providerFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testPritunlSettingsAttributeConfig("auditing", "true"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("pritunl_settings.test", "auditing", "true"),
+					testAccCheckSettingsValues(map[string]interface{}{"auditing": "all"}),
+				),
+			},
+			{
+				Config: testPritunlSettingsAttributeConfig("restrict_import", "true"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("pritunl_settings.test", "auditing", "true"),
+					testAccCheckSettingsValues(map[string]interface{}{"auditing": "all", "restrict_import": true}),
+				),
+			},
+			{
+				Config:      testPritunlSettingsAttributeConfig("auditing", "false"),
+				PlanOnly:    true,
+				ExpectError: regexp.MustCompile(`auditing`),
+			},
+			{
+				Config: testPritunlSettingsAttributeConfig("restrict_import", "false"),
+				Check:  testAccCheckSettingsValues(map[string]interface{}{"auditing": "all", "restrict_import": false}),
+			},
+		},
+	})
 }

@@ -191,6 +191,15 @@ func resourceSettings() *schema.Resource {
 				Computed:    true,
 				Description: "Whether the Pritunl client reconnects on its own once a connection drops. The web console only shows the toggle while single sign-on is enabled, but that is a detail of the console: `PUT /settings` takes the setting either way, and so does this resource, which never ties it to `sso`.",
 			},
+			// a one-way switch: Pritunl answers any attempt to turn auditing
+			// off with a 400, so the true to false change is refused by the
+			// CustomizeDiff at plan time and once more right before the write
+			"auditing": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Computed:    true,
+				Description: "Whether the instance keeps an audit log of the administrator and user actions, the `all` value of the `auditing` setting that `pritunl set app.auditing all` sets from the command line. It is a one-way switch: Pritunl never lets auditing be turned off once it is on and answers any attempt with a `400 cannot_disable_auditing`, so `false` is only accepted while auditing is still off, and configuring `false` on an instance where it is on fails the plan. Changing it requires the administrator of the provider credentials to be a super user, Pritunl answers anyone else with a `400 requires_super_user`. Destroying the resource leaves auditing as it is. Defaults to the value already configured on the instance.",
+			},
 		},
 		CreateContext: resourceCreateSettings,
 		ReadContext:   resourceReadSettings,
@@ -204,8 +213,9 @@ func resourceSettings() *schema.Resource {
 }
 
 // customizeSettingsDiff validates the single sign-on block of the raw
-// configuration and puts the change of sso_okta_mode back on the plan when it
-// is being turned off.
+// configuration, refuses to plan auditing off on an instance where it is on,
+// and puts the change of sso_okta_mode back on the plan when it is being
+// turned off.
 //
 // The empty mode is the Okta secondary factor disabled, a value of its own, but
 // the SDK reads the empty string of a computed attribute as "not configured"
@@ -220,6 +230,14 @@ func customizeSettingsDiff(ctx context.Context, d *schema.ResourceDiff, meta int
 	}
 
 	if err := validateSsoRawConfig(config); err != nil {
+		return err
+	}
+
+	// the state is what auditing is compared against, the instance as of the
+	// last refresh; a resource being created has no state yet and is checked
+	// against the instance itself right before the write
+	auditing, _ := d.GetChange("auditing")
+	if err := validateAuditingRawConfig(auditing.(bool), config); err != nil {
 		return err
 	}
 
@@ -277,6 +295,23 @@ func validateSsoRawConfig(config cty.Value) error {
 	}
 
 	return nil
+}
+
+// validateAuditingRawConfig refuses a configuration that turns auditing off
+// while it is on: Pritunl never lets auditing be turned off once enabled and
+// answers the write with a 400. Leaving auditing out of the configuration, or
+// an unknown value, is never refused, and neither is turning it on.
+func validateAuditingRawConfig(enabled bool, config cty.Value) error {
+	if !enabled || config.IsNull() || !config.IsKnown() {
+		return nil
+	}
+
+	value := config.GetAttr("auditing")
+	if value.IsNull() || !value.IsKnown() || value.True() {
+		return nil
+	}
+
+	return errors.New("auditing = false cannot be applied: auditing is on for this Pritunl instance and Pritunl never lets it be turned off once enabled, it refuses the write with a 400 cannot_disable_auditing; set auditing = true or remove it from the configuration")
 }
 
 // Pritunl strips the surrounding whitespace of the PEM values before storing
@@ -350,6 +385,7 @@ var settingsSsoAttributes = []string{
 // Every attribute the resource manages, used by the update to tell whether the
 // configuration has anything to write at all.
 var settingsAttributes = []string{
+	"auditing",
 	"client_reconnect",
 	"ipv6",
 	"pin_mode",
@@ -449,6 +485,10 @@ func resourceCreateSettings(ctx context.Context, d *schema.ResourceData, meta in
 		return diag.FromErr(err)
 	}
 
+	if err = validateAuditingRawConfig(settings.Auditing(), d.GetRawConfig()); err != nil {
+		return diag.FromErr(err)
+	}
+
 	portChanged := overlaySettings(d, settings)
 
 	if err = apiClient.UpdateSettings(settings); err != nil {
@@ -524,6 +564,9 @@ func resourceReadSettings(ctx context.Context, d *schema.ResourceData, meta inte
 		d.Set(attribute, settings.Bool(attribute))
 	}
 
+	// auditing is a string on the instance, "all" or null, and a boolean here
+	d.Set("auditing", settings.Auditing())
+
 	// GET /settings does return server_key and sso_okta_token in plain text,
 	// but they are deliberately not stored: they would copy the private key of
 	// the instance and an Okta credential into the state of every configuration
@@ -547,6 +590,10 @@ func resourceUpdateSettings(ctx context.Context, d *schema.ResourceData, meta in
 
 	settings, err := apiClient.GetSettings()
 	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	if err = validateAuditingRawConfig(settings.Auditing(), d.GetRawConfig()); err != nil {
 		return diag.FromErr(err)
 	}
 
@@ -621,6 +668,12 @@ func overlaySettings(d *schema.ResourceData, settings pritunl.Settings) bool {
 		}
 	}
 
+	// the write time check has already refused false on an instance where
+	// auditing is on, so false only ever reaches an instance where it is off
+	if settingConfigured(d, "auditing") {
+		settings.SetAuditing(d.Get("auditing").(bool))
+	}
+
 	portChanged := false
 
 	if settingConfigured(d, "server_port") {
@@ -677,10 +730,10 @@ func resourceDeleteSettings(ctx context.Context, d *schema.ResourceData, meta in
 	// self-signed default while restarting the web server.
 	//
 	// The certificate is the only managed setting with a meaningful "unset":
-	// none of the others has a value that would mean "the one from before", and
+	// none of the others has a value that would mean "the one from before",
 	// turning off single sign-on would discard every credential Pritunl holds
-	// for it. They are all handed back untouched by the round trip, server_port
-	// included.
+	// for it, and auditing cannot be turned off at all. They are all handed
+	// back untouched by the round trip, server_port and auditing included.
 	settings["server_cert"] = ""
 	settings["server_key"] = ""
 
