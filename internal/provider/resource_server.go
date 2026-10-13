@@ -516,18 +516,9 @@ func resourceServer() *schema.Resource {
 		UpdateContext: resourceUpdateServer,
 		DeleteContext: resourceDeleteServer,
 		Importer: &schema.ResourceImporter{
-			StateContext: resourceImportServer,
+			StateContext: schema.ImportStatePassthroughContext,
 		},
 	}
-}
-
-// resourceImportServer imports by id and records purge_default_routes at its
-// default: the setting is read only at creation and Pritunl does not store it.
-func resourceImportServer(ctx context.Context, d *schema.ResourceData, meta interface{}) ([]*schema.ResourceData, error) {
-	if err := d.Set("purge_default_routes", true); err != nil {
-		return nil, err
-	}
-	return []*schema.ResourceData{d}, nil
 }
 
 // Uses for importing
@@ -537,6 +528,15 @@ func resourceReadServer(ctx context.Context, d *schema.ResourceData, meta interf
 	server, err := apiClient.GetServer(d.Id())
 	if err != nil {
 		return diag.FromErr(err)
+	}
+
+	// purge_default_routes acts only at creation and Pritunl does not store
+	// it. A server in the state from before the attribute existed reads it as
+	// its default, so a provider upgrade plans no change.
+	if _, ok := d.GetOkExists("purge_default_routes"); !ok {
+		if err := d.Set("purge_default_routes", true); err != nil {
+			return diag.FromErr(err)
+		}
 	}
 
 	// get organizations
@@ -1171,11 +1171,6 @@ func validateDefaultRoutePair(routes []pritunl.Route) error {
 	return nil
 }
 
-// reconcileServerRoutes re-reads the live route table and converges it onto
-// the declared set. Pritunl acts on routes beyond the request that touched
-// them: deleting 0.0.0.0/0 also deletes its ::/0 companion, and routes the
-// server seeds itself carry Pritunl's own flag defaults — so right after the
-// CRUD calls a declared route can be missing or hold different attributes.
 // purgeDefaultRoutes deletes every route a server has right after its
 // creation: none of them is declared yet, so all are the ones Pritunl adds on
 // its own. Their set and networks vary by Pritunl version (the DNS Server
@@ -1199,6 +1194,11 @@ func purgeDefaultRoutes(apiClient pritunl.Client, serverId string) error {
 	return nil
 }
 
+// reconcileServerRoutes re-reads the live route table and converges it onto
+// the declared set. Pritunl acts on routes beyond the request that touched
+// them: deleting 0.0.0.0/0 also deletes its ::/0 companion, and routes the
+// server seeds itself carry Pritunl's own flag defaults — so right after the
+// CRUD calls a declared route can be missing or hold different attributes.
 func reconcileServerRoutes(apiClient pritunl.Client, serverId string, declared []pritunl.Route) error {
 	liveRoutes, err := apiClient.GetRoutesByServer(serverId)
 	if err != nil {

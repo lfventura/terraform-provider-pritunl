@@ -68,13 +68,47 @@ func TestAccPritunlServer(t *testing.T) {
 			CheckDestroy:      testPritunlServerDestroy,
 			Steps: []resource.TestStep{
 				{
-					Config: testPritunlServerConfigWithDnsServerAndRoute(serverName, "purge_default_routes = false"),
+					// The declared 0.0.0.0/0 (no NAT) meets the one Pritunl
+					// added (NAT): it is updated in place, not added twice.
+					Config: testPritunlServerConfigWithDnsServerAndRoute(serverName, `
+			purge_default_routes = false
+
+			route {
+				network = "0.0.0.0/0"
+				comment = "declared-default"
+				nat     = false
+			}`),
 					Check: resource.ComposeTestCheckFunc(
 						resource.TestCheckResourceAttr("pritunl_server.test", "purge_default_routes", "false"),
 						testPritunlServerLiveRoutes("pritunl_server.test", []string{"0.0.0.0/0", "10.99.0.53/32", "10.99.1.0/24"}),
+						testPritunlServerLiveRouteNat("pritunl_server.test", "0.0.0.0/0", false),
 					),
 					// The kept routes are not declared, so the next plan deletes them.
 					ExpectNonEmptyPlan: true,
+				},
+			},
+		})
+	})
+
+	t.Run("purge_default_routes plans no change on a server created before it existed", func(t *testing.T) {
+		serverName := "tfacc-server-upgrade"
+
+		resource.Test(t, resource.TestCase{
+			PreCheck:     func() { preCheck(t) },
+			CheckDestroy: testPritunlServerDestroy,
+			Steps: []resource.TestStep{
+				{
+					// 0.15.0 deletes the DNS Server route only at 8.8.8.8/32,
+					// so the server keeps that DNS to come out clean.
+					ExternalProviders: map[string]resource.ExternalProvider{
+						"pritunl": {Source: "lfventura/pritunl", VersionConstraint: "0.15.0"},
+					},
+					Config: testPritunlServerConfigWithDnsServer(serverName),
+				},
+				{
+					ProviderFactories: providerFactories,
+					Config:            testPritunlServerConfigWithDnsServer(serverName),
+					PlanOnly:          true,
 				},
 			},
 		})
@@ -800,6 +834,15 @@ func testPritunlServerConfigWithGroups(name string, groupName string) string {
 	`, name, groupName)
 }
 
+func testPritunlServerConfigWithDnsServer(name string) string {
+	return fmt.Sprintf(`
+		resource "pritunl_server" "test" {
+			name        = "%[1]s"
+			dns_servers = ["8.8.8.8"]
+		}
+	`, name)
+}
+
 func testPritunlServerConfigWithDnsServerAndRoute(name, extra string) string {
 	return fmt.Sprintf(`
 		resource "pritunl_server" "test" {
@@ -841,6 +884,30 @@ func testPritunlServerLiveRoutes(name string, want []string) resource.TestCheckF
 			return fmt.Errorf("live routes %v, expected %v", got, expected)
 		}
 		return nil
+	}
+}
+
+// testPritunlServerLiveRouteNat checks the NAT flag Pritunl holds for one
+// route of the server.
+func testPritunlServerLiveRouteNat(name, network string, nat bool) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources[name]
+		if !ok {
+			return fmt.Errorf("%s not found in the state", name)
+		}
+		routes, err := testClient.GetRoutesByServer(rs.Primary.ID)
+		if err != nil {
+			return err
+		}
+		for _, route := range routes {
+			if route.Network == network {
+				if route.Nat != nat {
+					return fmt.Errorf("route %s has nat %v, expected %v", network, route.Nat, nat)
+				}
+				return nil
+			}
+		}
+		return fmt.Errorf("route %s not found", network)
 	}
 }
 
