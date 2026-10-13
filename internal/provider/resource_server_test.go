@@ -3,7 +3,9 @@ package provider
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
@@ -28,6 +30,86 @@ func TestAccPritunlServer(t *testing.T) {
 				},
 				// import test
 				importStep("pritunl_server.test"),
+			},
+		})
+	})
+
+	t.Run("purge_default_routes deletes the routes Pritunl adds, the DNS Server route included", func(t *testing.T) {
+		serverName := "tfacc-server-purge"
+
+		// dns_servers moves Pritunl's DNS Server route off 8.8.8.8/32 onto
+		// 10.99.0.53/32; the purge reads the routes back, so it still finds it.
+		// The step's own empty-plan check is the regression test.
+		resource.Test(t, resource.TestCase{
+			PreCheck:          func() { preCheck(t) },
+			ProviderFactories: providerFactories,
+			CheckDestroy:      testPritunlServerDestroy,
+			Steps: []resource.TestStep{
+				{
+					Config: testPritunlServerConfigWithDnsServerAndRoute(serverName, ""),
+					Check: resource.ComposeTestCheckFunc(
+						resource.TestCheckResourceAttr("pritunl_server.test", "purge_default_routes", "true"),
+						resource.TestCheckResourceAttr("pritunl_server.test", "route.#", "1"),
+						resource.TestCheckResourceAttr("pritunl_server.test", "route.0.network", "10.99.1.0/24"),
+						testPritunlServerLiveRoutes("pritunl_server.test", []string{"10.99.1.0/24"}),
+					),
+				},
+				importStep("pritunl_server.test"),
+			},
+		})
+	})
+
+	t.Run("purge_default_routes false keeps the routes Pritunl adds", func(t *testing.T) {
+		serverName := "tfacc-server-keep"
+
+		resource.Test(t, resource.TestCase{
+			PreCheck:          func() { preCheck(t) },
+			ProviderFactories: providerFactories,
+			CheckDestroy:      testPritunlServerDestroy,
+			Steps: []resource.TestStep{
+				{
+					// The declared 0.0.0.0/0 (no NAT) meets the one Pritunl
+					// added (NAT): it is updated in place, not added twice.
+					Config: testPritunlServerConfigWithDnsServerAndRoute(serverName, `
+			purge_default_routes = false
+
+			route {
+				network = "0.0.0.0/0"
+				comment = "declared-default"
+				nat     = false
+			}`),
+					Check: resource.ComposeTestCheckFunc(
+						resource.TestCheckResourceAttr("pritunl_server.test", "purge_default_routes", "false"),
+						testPritunlServerLiveRoutes("pritunl_server.test", []string{"0.0.0.0/0", "10.99.0.53/32", "10.99.1.0/24"}),
+						testPritunlServerLiveRouteNat("pritunl_server.test", "0.0.0.0/0", false),
+					),
+					// The kept routes are not declared, so the next plan deletes them.
+					ExpectNonEmptyPlan: true,
+				},
+			},
+		})
+	})
+
+	t.Run("purge_default_routes plans no change on a server created before it existed", func(t *testing.T) {
+		serverName := "tfacc-server-upgrade"
+
+		resource.Test(t, resource.TestCase{
+			PreCheck:     func() { preCheck(t) },
+			CheckDestroy: testPritunlServerDestroy,
+			Steps: []resource.TestStep{
+				{
+					// 0.15.0 deletes the DNS Server route only at 8.8.8.8/32,
+					// so the server keeps that DNS to come out clean.
+					ExternalProviders: map[string]resource.ExternalProvider{
+						"pritunl": {Source: "lfventura/pritunl", VersionConstraint: "0.15.0"},
+					},
+					Config: testPritunlServerConfigWithDnsServer(serverName),
+				},
+				{
+					ProviderFactories: providerFactories,
+					Config:            testPritunlServerConfigWithDnsServer(serverName),
+					PlanOnly:          true,
+				},
 			},
 		})
 	})
@@ -750,6 +832,83 @@ func testPritunlServerConfigWithGroups(name string, groupName string) string {
 			groups    = ["%[2]s"]
 		}
 	`, name, groupName)
+}
+
+func testPritunlServerConfigWithDnsServer(name string) string {
+	return fmt.Sprintf(`
+		resource "pritunl_server" "test" {
+			name        = "%[1]s"
+			dns_servers = ["8.8.8.8"]
+		}
+	`, name)
+}
+
+func testPritunlServerConfigWithDnsServerAndRoute(name, extra string) string {
+	return fmt.Sprintf(`
+		resource "pritunl_server" "test" {
+			name        = "%[1]s"
+			dns_servers = ["10.99.0.53"]
+			%[2]s
+
+			route {
+				network = "10.99.1.0/24"
+				comment = "declared"
+				nat     = false
+			}
+		}
+	`, name, extra)
+}
+
+// testPritunlServerLiveRoutes checks the server's routes as Pritunl holds
+// them, virtual network routes aside, against the expected networks.
+func testPritunlServerLiveRoutes(name string, want []string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources[name]
+		if !ok {
+			return fmt.Errorf("%s not found in the state", name)
+		}
+		routes, err := testClient.GetRoutesByServer(rs.Primary.ID)
+		if err != nil {
+			return err
+		}
+		got := make([]string, 0, len(routes))
+		for _, route := range routes {
+			if !route.VirtualNetwork {
+				got = append(got, route.Network)
+			}
+		}
+		sort.Strings(got)
+		expected := append([]string(nil), want...)
+		sort.Strings(expected)
+		if strings.Join(got, ",") != strings.Join(expected, ",") {
+			return fmt.Errorf("live routes %v, expected %v", got, expected)
+		}
+		return nil
+	}
+}
+
+// testPritunlServerLiveRouteNat checks the NAT flag Pritunl holds for one
+// route of the server.
+func testPritunlServerLiveRouteNat(name, network string, nat bool) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources[name]
+		if !ok {
+			return fmt.Errorf("%s not found in the state", name)
+		}
+		routes, err := testClient.GetRoutesByServer(rs.Primary.ID)
+		if err != nil {
+			return err
+		}
+		for _, route := range routes {
+			if route.Network == network {
+				if route.Nat != nat {
+					return fmt.Errorf("route %s has nat %v, expected %v", network, route.Nat, nat)
+				}
+				return nil
+			}
+		}
+		return fmt.Errorf("route %s not found", network)
+	}
 }
 
 func testPritunlServerDestroy(s *terraform.State) error {

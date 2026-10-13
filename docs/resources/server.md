@@ -56,6 +56,7 @@ The organization resource allows managing information about a particular Pritunl
 - `port_wg` (Number) Network address for the private network that will be created for clients. This network cannot conflict with any existing local networks
 - `pre_connect_msg` (String) Messages that will be shown after connect to the server
 - `protocol` (String) The protocol for the server
+- `purge_default_routes` (Boolean) Whether the routes Pritunl adds to a new server on its own (`0.0.0.0/0` with NAT and, on Pritunl versions that add it, the `DNS Server` route, whose network follows the first `dns_servers` entry) are deleted right after the server is created, leaving only the declared `route` blocks. Read only at creation. When `false`, those routes stay, and any of them not declared in a `route` block shows as a removal on the next plan; declare the ones to keep. Defaults to `true`.
 - `replica_count` (Number) Replicate server across multiple hosts.
 - `restrict_routes` (Boolean) Prevent traffic from networks not specified in the servers routes from being tunneled over the vpn.
 - `route` (Block List) The list of attached routes to the server (see [below for nested schema](#nestedblock--route))
