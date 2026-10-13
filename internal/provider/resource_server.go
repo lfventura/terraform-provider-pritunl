@@ -472,6 +472,12 @@ func resourceServer() *schema.Resource {
 				Optional:    true,
 				Description: "The list of attached routes to the server",
 			},
+			"purge_default_routes": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     true,
+				Description: "Whether the routes Pritunl adds to a new server on its own (`0.0.0.0/0` with NAT and, on Pritunl versions that add it, the `DNS Server` route, whose network follows the first `dns_servers` entry) are deleted right after the server is created, leaving only the declared `route` blocks. Read only at creation. When `false`, those routes stay, and any of them not declared in a `route` block shows as a removal on the next plan; declare the ones to keep.",
+			},
 			"status": {
 				Type:         schema.TypeString,
 				Required:     false,
@@ -510,9 +516,18 @@ func resourceServer() *schema.Resource {
 		UpdateContext: resourceUpdateServer,
 		DeleteContext: resourceDeleteServer,
 		Importer: &schema.ResourceImporter{
-			StateContext: schema.ImportStatePassthroughContext,
+			StateContext: resourceImportServer,
 		},
 	}
+}
+
+// resourceImportServer imports by id and records purge_default_routes at its
+// default: the setting is read only at creation and Pritunl does not store it.
+func resourceImportServer(ctx context.Context, d *schema.ResourceData, meta interface{}) ([]*schema.ResourceData, error) {
+	if err := d.Set("purge_default_routes", true); err != nil {
+		return nil, err
+	}
+	return []*schema.ResourceData{d}, nil
 }
 
 // Uses for importing
@@ -727,13 +742,8 @@ func resourceCreateServer(ctx context.Context, d *schema.ResourceData, meta inte
 		}
 	}
 
-	// Delete default routes
-	defaultRoutes := []pritunl.Route{
-		{Network: "0.0.0.0/0", Nat: true},
-		{Network: "8.8.8.8/32", Nat: true}, // DNS Server route added in newer Pritunl versions
-	}
-	for _, defaultRoute := range defaultRoutes {
-		err = apiClient.DeleteRouteFromServer(d.Id(), defaultRoute)
+	if d.Get("purge_default_routes").(bool) {
+		err = purgeDefaultRoutes(apiClient, d.Id())
 		if err != nil {
 			return diag.Errorf("Error on deleting default route from the server: %s", err)
 		}
@@ -751,9 +761,14 @@ func resourceCreateServer(ctx context.Context, d *schema.ResourceData, meta inte
 			return diag.FromErr(err)
 		}
 
-		err = apiClient.AddRoutesToServer(d.Id(), routes)
-		if err != nil {
-			return diag.Errorf("Error on attaching route from the server: %s", err)
+		// With the default routes kept, a declared route may already exist
+		// (0.0.0.0/0); the reconcile adds the missing ones one by one and
+		// converges the existing ones instead of adding them again.
+		if d.Get("purge_default_routes").(bool) {
+			err = apiClient.AddRoutesToServer(d.Id(), routes)
+			if err != nil {
+				return diag.Errorf("Error on attaching route from the server: %s", err)
+			}
 		}
 
 		err = reconcileServerRoutes(apiClient, d.Id(), routes)
@@ -1161,6 +1176,29 @@ func validateDefaultRoutePair(routes []pritunl.Route) error {
 // them: deleting 0.0.0.0/0 also deletes its ::/0 companion, and routes the
 // server seeds itself carry Pritunl's own flag defaults — so right after the
 // CRUD calls a declared route can be missing or hold different attributes.
+// purgeDefaultRoutes deletes every route a server has right after its
+// creation: none of them is declared yet, so all are the ones Pritunl adds on
+// its own. Their set and networks vary by Pritunl version (the DNS Server
+// route takes the first dns_servers entry), so they are read back rather than
+// listed. The virtual network routes are the server's own network and stay.
+func purgeDefaultRoutes(apiClient pritunl.Client, serverId string) error {
+	liveRoutes, err := apiClient.GetRoutesByServer(serverId)
+	if err != nil {
+		return fmt.Errorf("reading the routes back: %w", err)
+	}
+
+	for _, route := range liveRoutes {
+		if route.VirtualNetwork || route.NetworkLink || route.ServerLink {
+			continue
+		}
+		if err := apiClient.DeleteRouteFromServer(serverId, route); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func reconcileServerRoutes(apiClient pritunl.Client, serverId string, declared []pritunl.Route) error {
 	liveRoutes, err := apiClient.GetRoutesByServer(serverId)
 	if err != nil {
