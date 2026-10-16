@@ -81,5 +81,5 @@ Required:
 Optional:
 
 - `comment` (String) Comment for route. Pritunl 1.34.4763 and later store it filtered down to letters, digits and `-=_@.:/!#$&*+?^|~`, dropping spaces, commas and parentheses; a comment that differs from the stored one only by those characters is not a change.
-- `nat` (Boolean) NAT vpn traffic destined to this network
-- `net_gateway` (Boolean) Net Gateway vpn traffic destined to this network
+- `nat` (Boolean) NAT vpn traffic destined to this network. Defaults to `false`, the value the provider has always created a route with when the attribute is left out; a route that leaves it out is held at `false`, so a value changed on the instance outside of Terraform shows in the plan.
+- `net_gateway` (Boolean) Send the traffic destined to this network through the client's local gateway instead of the tunnel (a VPN bypass). Defaults to `false`; a route that leaves it out is held at `false`, so a value changed on the instance outside of Terraform shows in the plan.

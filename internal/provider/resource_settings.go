@@ -67,9 +67,9 @@ func resourceSettings() *schema.Resource {
 			"server_port": {
 				Type:         schema.TypeInt,
 				Optional:     true,
-				Computed:     true,
+				Default:      443,
 				ValidateFunc: validation.IntBetween(1, 65535),
-				Description:  "The port the web console and the API listen on. Defaults to the port already configured on the instance. Changing it also requires updating the `url` of the provider.",
+				Description:  "The port the web console and the API listen on. Defaults to `443`; a configuration that leaves it out holds the instance at 443, so a port changed on the instance outside of Terraform shows in the plan. Changing it also requires updating the `url` of the provider.",
 			},
 			"pin_mode": {
 				Type:         schema.TypeString,
@@ -676,11 +676,11 @@ func overlaySettings(d *schema.ResourceData, settings pritunl.Settings) bool {
 
 	portChanged := false
 
-	if settingConfigured(d, "server_port") {
-		port := d.Get("server_port").(int)
-		portChanged = port != settings.Int("server_port")
-		settings["server_port"] = port
-	}
+	// server_port always carries a value (443 unless configured), so it is
+	// always written: the instance is held at it.
+	port := d.Get("server_port").(int)
+	portChanged = port != settings.Int("server_port")
+	settings["server_port"] = port
 
 	return portChanged
 }
