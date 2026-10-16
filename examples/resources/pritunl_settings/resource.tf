@@ -112,7 +112,9 @@ resource "pritunl_settings" "main" {
 
 # The instance wide toggles and the pin mode. Every attribute left out of the
 # configuration is read back from the instance and handed over unchanged, so
-# this only ever moves the settings it mentions:
+# this only ever moves the settings it mentions. The exception is `server_port`,
+# which defaults to 443: an instance whose console listens on another port sets
+# `server_port` here too, or this moves it to 443:
 
 # resource "pritunl_settings" "toggles" {
 #   pin_mode         = "required"
