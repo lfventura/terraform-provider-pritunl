@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -361,5 +362,20 @@ func TestCustomizeSettingsDiffAuditing(t *testing.T) {
 				t.Fatalf("plan: unexpected error %q", err)
 			}
 		})
+	}
+}
+
+// TestOverlaySettingsServerPortDefault: a configuration that leaves
+// server_port out holds the instance at 443, writing it over another port.
+func TestOverlaySettingsServerPortDefault(t *testing.T) {
+	d := settingsResourceData(t, map[string]interface{}{}, nil)
+	// the instance answers with a JSON number, as the API does
+	settings := pritunl.Settings{"server_port": json.Number("8443")}
+
+	if changed := overlaySettings(d, settings); !changed {
+		t.Fatal("overlaySettings reported the port as unchanged, expected 8443 -> 443 to be a change")
+	}
+	if got := settings["server_port"]; got != 443 {
+		t.Fatalf("server_port written as %v, expected the default 443", got)
 	}
 }

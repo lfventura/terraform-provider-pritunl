@@ -114,6 +114,72 @@ func TestAccPritunlServer(t *testing.T) {
 		})
 	})
 
+	t.Run("route nat and net_gateway left out are held at false against an out-of-band change", func(t *testing.T) {
+		serverName := "tfacc-server-route-defaults"
+
+		resource.Test(t, resource.TestCase{
+			PreCheck:          func() { preCheck(t) },
+			ProviderFactories: providerFactories,
+			CheckDestroy:      testPritunlServerDestroy,
+			Steps: []resource.TestStep{
+				{
+					Config: testPritunlServerConfigWithUndeclaredRouteFlags(serverName),
+					Check: resource.ComposeTestCheckFunc(
+						resource.TestCheckResourceAttr("pritunl_server.test", "route.0.nat", "false"),
+						resource.TestCheckResourceAttr("pritunl_server.test", "route.0.net_gateway", "false"),
+						testPritunlServerLiveRouteFlags("pritunl_server.test", "10.99.2.0/24", false, false),
+					),
+				},
+				{
+					// net_gateway turned on outside of Terraform, as from the
+					// web console (Pritunl refuses it together with NAT, so
+					// the two flags are changed one at a time): the plan has
+					// to show it, and the apply turns it back off
+					PreConfig:          testPritunlServerSetLiveRouteFlags(serverName, "10.99.2.0/24", false, true),
+					Config:             testPritunlServerConfigWithUndeclaredRouteFlags(serverName),
+					PlanOnly:           true,
+					ExpectNonEmptyPlan: true,
+				},
+				{
+					Config: testPritunlServerConfigWithUndeclaredRouteFlags(serverName),
+					Check:  testPritunlServerLiveRouteFlags("pritunl_server.test", "10.99.2.0/24", false, false),
+				},
+				{
+					PreConfig:          testPritunlServerSetLiveRouteFlags(serverName, "10.99.2.0/24", true, false),
+					Config:             testPritunlServerConfigWithUndeclaredRouteFlags(serverName),
+					PlanOnly:           true,
+					ExpectNonEmptyPlan: true,
+				},
+				{
+					Config: testPritunlServerConfigWithUndeclaredRouteFlags(serverName),
+					Check:  testPritunlServerLiveRouteFlags("pritunl_server.test", "10.99.2.0/24", false, false),
+				},
+			},
+		})
+	})
+
+	t.Run("route defaults plan no change on a server created before them", func(t *testing.T) {
+		serverName := "tfacc-server-route-defaults-upgrade"
+
+		resource.Test(t, resource.TestCase{
+			PreCheck:     func() { preCheck(t) },
+			CheckDestroy: testPritunlServerDestroy,
+			Steps: []resource.TestStep{
+				{
+					ExternalProviders: map[string]resource.ExternalProvider{
+						"pritunl": {Source: "lfventura/pritunl", VersionConstraint: "0.15.1"},
+					},
+					Config: testPritunlServerConfigWithUndeclaredRouteFlags(serverName),
+				},
+				{
+					ProviderFactories: providerFactories,
+					Config:            testPritunlServerConfigWithUndeclaredRouteFlags(serverName),
+					PlanOnly:          true,
+				},
+			},
+		})
+	})
+
 	t.Run("creates a server with sso_auth attribute", func(t *testing.T) {
 		serverName := "tfacc-server1"
 
@@ -903,6 +969,74 @@ func testPritunlServerLiveRouteNat(name, network string, nat bool) resource.Test
 			if route.Network == network {
 				if route.Nat != nat {
 					return fmt.Errorf("route %s has nat %v, expected %v", network, route.Nat, nat)
+				}
+				return nil
+			}
+		}
+		return fmt.Errorf("route %s not found", network)
+	}
+}
+
+func testPritunlServerConfigWithUndeclaredRouteFlags(name string) string {
+	return fmt.Sprintf(`
+		resource "pritunl_server" "test" {
+			name = "%[1]s"
+
+			route {
+				network = "10.99.2.0/24"
+				comment = "flags-left-out"
+			}
+		}
+	`, name)
+}
+
+// testPritunlServerSetLiveRouteFlags changes one route of the named server on
+// the instance directly, the way the web console would.
+func testPritunlServerSetLiveRouteFlags(serverName, network string, nat, netGateway bool) func() {
+	return func() {
+		servers, err := testClient.GetServers()
+		if err != nil {
+			panic(err)
+		}
+		for _, server := range servers {
+			if server.Name != serverName {
+				continue
+			}
+			routes, err := testClient.GetRoutesByServer(server.ID)
+			if err != nil {
+				panic(err)
+			}
+			for _, route := range routes {
+				if route.Network == network {
+					route.Nat = nat
+					route.NetGateway = netGateway
+					if err := testClient.UpdateRouteOnServer(server.ID, route); err != nil {
+						panic(err)
+					}
+					return
+				}
+			}
+		}
+		panic(fmt.Sprintf("route %s of server %s not found", network, serverName))
+	}
+}
+
+// testPritunlServerLiveRouteFlags checks the NAT and Net Gateway flags Pritunl
+// holds for one route of the server.
+func testPritunlServerLiveRouteFlags(name, network string, nat, netGateway bool) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources[name]
+		if !ok {
+			return fmt.Errorf("%s not found in the state", name)
+		}
+		routes, err := testClient.GetRoutesByServer(rs.Primary.ID)
+		if err != nil {
+			return err
+		}
+		for _, route := range routes {
+			if route.Network == network {
+				if route.Nat != nat || route.NetGateway != netGateway {
+					return fmt.Errorf("route %s has nat %v net_gateway %v, expected %v %v", network, route.Nat, route.NetGateway, nat, netGateway)
 				}
 				return nil
 			}

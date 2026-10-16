@@ -96,6 +96,21 @@ func TestAccPritunlSettings(t *testing.T) {
 		})
 	})
 
+	// server_port left out is held at 443, the port the test instance (and
+	// every instance the default fits) serves on.
+	t.Run("holds the port at 443 when the configuration leaves it out", func(t *testing.T) {
+		resource.Test(t, resource.TestCase{
+			PreCheck:          func() { preCheck(t) },
+			ProviderFactories: providerFactories,
+			Steps: []resource.TestStep{
+				{
+					Config: `resource "pritunl_settings" "test" {}`,
+					Check:  resource.TestCheckResourceAttr("pritunl_settings.test", "server_port", "443"),
+				},
+			},
+		})
+	})
+
 	// The reason the resource writes the complete settings object back: a
 	// Terraform run that only manages the port must leave every other setting
 	// of the instance alone. A few unrelated settings are configured out of
