@@ -745,9 +745,10 @@ func resourceDeleteSettings(ctx context.Context, d *schema.ResourceData, meta in
 
 	// Pritunl accepted the reset, so the resource is gone whatever the restart
 	// does next. The wait only confirms the web server came back: when it does
-	// not answer in time the destroy still completes, with a warning, since
-	// failing it would leave in the state a resource that no longer exists and
-	// make every later destroy retry the reset and the wait.
+	// not answer in time the destroy still completes, with a warning, so the
+	// resources destroyed after this one go in the same run. A failed run would
+	// leave them for a next one, whose provider already meets the self-signed
+	// certificate and stops at the connection check.
 	if err = waitForWebServer(ctx, apiClient); err != nil {
 		return diag.Diagnostics{{
 			Severity: diag.Warning,
