@@ -53,7 +53,7 @@ func resourceSettings() *schema.Resource {
 				Computed:     true,
 				RequiredWith: []string{"server_key"},
 				StateFunc:    trimSpaceStateFunc,
-				Description:  "The certificate served by the web console and the API, as pure concatenated PEM blocks: the leaf certificate followed by the intermediate certificate(s), in that order. The root CA certificate must be left out, clients already trust it through their own trust store and only need the intermediates to build the chain. Nothing but `-----BEGIN CERTIFICATE-----` blocks may be present: the `Bag Attributes`, `subject=` and `issuer=` lines that `openssl pkcs12 -nokeys` writes in front of every block are OpenSSL specific text, not part of the PEM format, and Pritunl rejects a certificate that still carries them. Destroying the resource hands the certificate back to Pritunl, which regenerates its self-signed default.",
+				Description:  "The certificate served by the web console and the API, as pure concatenated PEM blocks: the leaf certificate followed by the intermediate certificate(s), in that order. The root CA certificate must be left out, clients already trust it through their own trust store and only need the intermediates to build the chain. Nothing but `-----BEGIN CERTIFICATE-----` blocks may be present: the `Bag Attributes`, `subject=` and `issuer=` lines that `openssl pkcs12 -nokeys` writes in front of every block are OpenSSL specific text, not part of the PEM format, and Pritunl rejects a certificate that still carries them. Destroying the resource hands the certificate back to Pritunl, which regenerates its self-signed default; a web server that does not answer again within two minutes after that reset is reported as a warning, and the destroy completes.",
 			},
 			"server_key": {
 				Type:         schema.TypeString,
@@ -741,11 +741,20 @@ func resourceDeleteSettings(ctx context.Context, d *schema.ResourceData, meta in
 		return diag.FromErr(err)
 	}
 
-	if err = waitForWebServer(ctx, apiClient); err != nil {
-		return diag.FromErr(err)
-	}
-
 	d.SetId("")
+
+	// Pritunl accepted the reset, so the resource is gone whatever the restart
+	// does next. The wait only confirms the web server came back: when it does
+	// not answer in time the destroy still completes, with a warning, since
+	// failing it would leave in the state a resource that no longer exists and
+	// make every later destroy retry the reset and the wait.
+	if err = waitForWebServer(ctx, apiClient); err != nil {
+		return diag.Diagnostics{{
+			Severity: diag.Warning,
+			Summary:  "The Pritunl web server did not come back after the certificate reset",
+			Detail:   fmt.Sprintf("Pritunl accepted the reset of the managed certificate and the resource is destroyed, but its web server did not answer again in time: %s. Check the web console before the next Terraform run on this instance.", err),
+		}}
+	}
 
 	return nil
 }
