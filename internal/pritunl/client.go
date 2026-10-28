@@ -23,6 +23,7 @@ type Client interface {
 	CreateUser(newUser User) (*User, error)
 	UpdateUser(id string, user *User) error
 	DeleteUser(id string, orgId string) error
+	GetUserProfile(orgId, userId, serverId string) (UserProfile, error)
 
 	GetServers() ([]Server, error)
 	GetServer(id string) (*Server, error)
@@ -779,6 +780,30 @@ func (c client) UpdateUser(id string, user *User) error {
 	}
 
 	return nil
+}
+
+func (c client) GetUserProfile(orgId, userId, serverId string) (UserProfile, error) {
+	url := fmt.Sprintf("/data/%s/%s/%s.key", orgId, userId, serverId)
+	req, err := http.NewRequest("GET", url, nil)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return UserProfile{}, fmt.Errorf("GetUserProfile: Error on HTTP request: %s", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		// the body of a failed download is an error message, never a profile
+		return UserProfile{}, fmt.Errorf("Non-200 response on getting the user profile\ncode=%d\nbody=%s", resp.StatusCode, body)
+	}
+
+	profile, err := ParseUserProfile(string(body))
+	if err != nil {
+		return UserProfile{}, fmt.Errorf("GetUserProfile: %s (organization=%s, user=%s, server=%s)", err, orgId, userId, serverId)
+	}
+
+	return profile, nil
 }
 
 func (c client) DeleteUser(id string, orgId string) error {
