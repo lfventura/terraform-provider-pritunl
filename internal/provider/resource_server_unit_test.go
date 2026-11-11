@@ -20,3 +20,11 @@ func TestValidateOvpnDco(t *testing.T) {
 		}
 	}
 }
+
+func TestServerStatus(t *testing.T) {
+	for in, want := range map[string]string{"pending": "offline", "offline": "offline", "online": "online"} {
+		if got := serverStatus(in); got != want {
+			t.Errorf("serverStatus(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

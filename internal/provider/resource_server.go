@@ -604,7 +604,7 @@ func resourceReadServer(ctx context.Context, d *schema.ResourceData, meta interf
 	d.Set("vxlan", server.VxLan)
 	d.Set("geo_sort", server.GeoSort)
 	d.Set("ovpn_dco", server.OvpnDco)
-	d.Set("status", server.Status)
+	d.Set("status", serverStatus(server.Status))
 
 	if len(organizations) > 0 {
 		organizationsList := make([]string, 0)
@@ -1164,6 +1164,16 @@ func validateOvpnDco(ovpnDco bool, cipher string) error {
 		return fmt.Errorf("ovpn_dco = true requires a cipher: the data channel offload does not run with cipher = \"none\"")
 	}
 	return nil
+}
+
+// serverStatus is the status the resource reports for the one Pritunl
+// returns. Pritunl reports "pending" for a server whose DH parameters are not
+// generated yet; such a server cannot be started, so it is offline.
+func serverStatus(status string) string {
+	if status == pritunl.ServerStatusPending {
+		return pritunl.ServerStatusOffline
+	}
+	return status
 }
 
 // checkOvpnDcoTaken reads the server back after a write that turned the data

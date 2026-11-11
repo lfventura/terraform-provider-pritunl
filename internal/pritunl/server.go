@@ -8,6 +8,9 @@ import (
 const (
 	ServerStatusOnline  = "online"
 	ServerStatusOffline = "offline"
+	// ServerStatusPending is what Pritunl reports while the DH parameters of
+	// a new server are generated
+	ServerStatusPending = "pending"
 
 	ServerNetworkModeTunnel = "tunnel"
 	ServerNetworkModeBridge = "bridge"
