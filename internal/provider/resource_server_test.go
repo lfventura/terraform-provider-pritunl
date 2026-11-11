@@ -404,6 +404,39 @@ func TestAccPritunlServer(t *testing.T) {
 		})
 	})
 
+	t.Run("ovpn_dco turns on, turns off and needs a cipher", func(t *testing.T) {
+		serverName := "tfacc-server-dco"
+
+		resource.Test(t, resource.TestCase{
+			PreCheck:          func() { preCheck(t) },
+			ProviderFactories: providerFactories,
+			CheckDestroy:      testPritunlServerDestroy,
+			Steps: []resource.TestStep{
+				{
+					Config: testPritunlServerConfigWithOvpnDco(serverName, true, "aes256"),
+					Check: resource.ComposeTestCheckFunc(
+						resource.TestCheckResourceAttr("pritunl_server.test", "ovpn_dco", "true"),
+						testPritunlServerLiveOvpnDco("pritunl_server.test", true),
+					),
+				},
+				importStep("pritunl_server.test"),
+				{
+					// false is written, not omitted: Pritunl keeps the
+					// previous value of a key the request leaves out
+					Config: testPritunlServerConfigWithOvpnDco(serverName, false, "aes256"),
+					Check: resource.ComposeTestCheckFunc(
+						resource.TestCheckResourceAttr("pritunl_server.test", "ovpn_dco", "false"),
+						testPritunlServerLiveOvpnDco("pritunl_server.test", false),
+					),
+				},
+				{
+					Config:      testPritunlServerConfigWithOvpnDco(serverName, true, "none"),
+					ExpectError: regexp.MustCompile(`ovpn_dco = true requires a cipher`),
+				},
+			},
+		})
+	})
+
 	t.Run("creates a server with an attached organization", func(t *testing.T) {
 		serverName := "tfacc-server1"
 		orgName := "tfacc-org1"
@@ -794,6 +827,35 @@ func testPritunlServerConfigWithGeoSort(name string, geoSort bool) string {
 			geo_sort = %[2]v
 		}
 	`, name, geoSort)
+}
+
+func testPritunlServerConfigWithOvpnDco(name string, ovpnDco bool, cipher string) string {
+	return fmt.Sprintf(`
+		resource "pritunl_server" "test" {
+			name     = "%[1]s"
+			cipher   = "%[3]s"
+			ovpn_dco = %[2]v
+		}
+	`, name, ovpnDco, cipher)
+}
+
+// testPritunlServerLiveOvpnDco reads the server from the API, so a value the
+// provider stored without Pritunl taking it fails the check.
+func testPritunlServerLiveOvpnDco(name string, want bool) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources[name]
+		if !ok {
+			return fmt.Errorf("%s is not in the state", name)
+		}
+		server, err := testClient.GetServer(rs.Primary.ID)
+		if err != nil {
+			return err
+		}
+		if server.OvpnDco != want {
+			return fmt.Errorf("ovpn_dco in Pritunl is %v, want %v", server.OvpnDco, want)
+		}
+		return nil
+	}
 }
 
 func testPritunlServerConfigWithAttachedOrganization(name, organizationName string) string {

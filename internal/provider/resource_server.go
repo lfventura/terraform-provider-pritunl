@@ -414,6 +414,12 @@ func resourceServer() *schema.Resource {
 				Optional:    true,
 				Description: "Enable geo sorting for host selection. Clients will connect to the closest host based on GeoIP lookup.",
 			},
+			"ovpn_dco": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     false,
+				Description: "Enable OpenVPN Data Channel Offload, Pritunl's \"Data Channel Offload (Beta)\" option: the data channel runs in the kernel module `ovpn` or `ovpn-dco-v2`, which Pritunl loads when the server starts, and the server uses only the AEAD form of `cipher` (the CBC choices become their GCM counterparts). Every host of the server needs OpenVPN built with DCO and one of those modules; without them OpenVPN runs the data channel in user space. Not allowed with `cipher = \"none\"`. Changing it restarts the server, as every change to this resource does.",
+			},
 			"organization_ids": {
 				Type: schema.TypeList,
 				Elem: &schema.Schema{
@@ -509,6 +515,7 @@ func resourceServer() *schema.Resource {
 				},
 			},
 		},
+		CustomizeDiff: customizeDiffServer,
 		CreateContext: resourceCreateServer,
 		ReadContext:   resourceReadServer,
 		UpdateContext: resourceUpdateServer,
@@ -596,6 +603,7 @@ func resourceReadServer(ctx context.Context, d *schema.ResourceData, meta interf
 	d.Set("inter_client", server.InterClient)
 	d.Set("vxlan", server.VxLan)
 	d.Set("geo_sort", server.GeoSort)
+	d.Set("ovpn_dco", server.OvpnDco)
 	d.Set("status", server.Status)
 
 	if len(organizations) > 0 {
@@ -721,6 +729,7 @@ func resourceCreateServer(ctx context.Context, d *schema.ResourceData, meta inte
 		"inter_client":       d.Get("inter_client"),
 		"vxlan":              d.Get("vxlan"),
 		"geo_sort":           d.Get("geo_sort"),
+		"ovpn_dco":           d.Get("ovpn_dco"),
 	}
 
 	server, err := apiClient.CreateServer(serverData)
@@ -981,6 +990,10 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 		server.GeoSort = d.Get("geo_sort").(bool)
 	}
 
+	if d.HasChange("ovpn_dco") {
+		server.OvpnDco = d.Get("ovpn_dco").(bool)
+	}
+
 	if d.HasChange("groups") {
 		groups := make([]string, 0)
 		for _, v := range d.Get("groups").([]interface{}) {
@@ -1127,6 +1140,19 @@ func resourceDeleteServer(ctx context.Context, d *schema.ResourceData, meta inte
 
 	d.SetId("")
 
+	return nil
+}
+
+func customizeDiffServer(_ context.Context, d *schema.ResourceDiff, _ interface{}) error {
+	return validateOvpnDco(d.Get("ovpn_dco").(bool), d.Get("cipher").(string))
+}
+
+// validateOvpnDco rejects the data channel offload with no cipher: the
+// offload only carries AEAD ciphers.
+func validateOvpnDco(ovpnDco bool, cipher string) error {
+	if ovpnDco && cipher == "none" {
+		return fmt.Errorf("ovpn_dco = true requires a cipher: the data channel offload does not run with cipher = \"none\"")
+	}
 	return nil
 }
 

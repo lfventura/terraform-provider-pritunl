@@ -61,7 +61,10 @@ type Server struct {
 	JumboFrames      bool     `json:"jumbo_frames,omitempty"`
 	Debug            bool     `json:"debug,omitempty"`
 	GeoSort          bool     `json:"geo_sort,omitempty"`
-	Status           string   `json:"status,omitempty"`
+	// OvpnDco is always sent: Pritunl only changes it when the key is
+	// present, so an omitted false would leave it on.
+	OvpnDco bool   `json:"ovpn_dco"`
+	Status  string `json:"status,omitempty"`
 }
 
 func (s *Server) MarshalJSON() ([]byte, error) {

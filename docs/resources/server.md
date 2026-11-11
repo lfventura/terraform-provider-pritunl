@@ -50,6 +50,7 @@ The organization resource allows managing information about a particular Pritunl
 - `network_wg` (String) Network address for the private network that will be created for clients. This network cannot conflict with any existing local networks
 - `organization_ids` (List of String) The list of attached organizations to the server.
 - `otp_auth` (Boolean) Enables two-step authentication using Google Authenticator. Verification code is entered as the user password when connecting
+- `ovpn_dco` (Boolean) Enable OpenVPN Data Channel Offload, Pritunl's "Data Channel Offload (Beta)" option: the data channel runs in the kernel module `ovpn` or `ovpn-dco-v2`, which Pritunl loads when the server starts, and the server uses only the AEAD form of `cipher` (the CBC choices become their GCM counterparts). Every host of the server needs OpenVPN built with DCO and one of those modules; without them OpenVPN runs the data channel in user space. Not allowed with `cipher = "none"`. Changing it restarts the server, as every change to this resource does.
 - `ping_interval` (Number) Interval to ping client
 - `ping_timeout` (Number) Timeout for client ping. Must be greater then ping interval
 - `port` (Number) The port for the server
