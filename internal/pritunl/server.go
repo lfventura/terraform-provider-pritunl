@@ -64,8 +64,8 @@ type Server struct {
 	JumboFrames      bool     `json:"jumbo_frames,omitempty"`
 	Debug            bool     `json:"debug,omitempty"`
 	GeoSort          bool     `json:"geo_sort,omitempty"`
-	// OvpnDco is always sent: Pritunl only changes it when the key is
-	// present, so an omitted false would leave it on.
+	// OvpnDco is always written, so every request states the offload; a key
+	// the request leaves out reaches the backend as false through pritunl-web
 	OvpnDco bool   `json:"ovpn_dco"`
 	Status  string `json:"status,omitempty"`
 }

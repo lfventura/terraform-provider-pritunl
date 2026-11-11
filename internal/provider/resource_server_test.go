@@ -439,8 +439,8 @@ func TestAccPritunlServer(t *testing.T) {
 				},
 				importStep("pritunl_server.test"),
 				{
-					// false is written, not omitted: Pritunl keeps the
-					// previous value of a key the request leaves out
+					// turned off, checked against the API and not only
+					// against the state
 					Config: testPritunlServerConfigWithOvpnDco(serverName, false, "aes256"),
 					Check: resource.ComposeTestCheckFunc(
 						resource.TestCheckResourceAttr("pritunl_server.test", "ovpn_dco", "false"),

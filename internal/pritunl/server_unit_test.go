@@ -5,8 +5,7 @@ import (
 	"testing"
 )
 
-// Pritunl only changes ovpn_dco when the request carries the key, so turning
-// the offload off needs an explicit false in the body.
+// The request body states ovpn_dco for both values, false included.
 func TestServerMarshalJSONWritesOvpnDcoFalse(t *testing.T) {
 	for _, want := range []bool{true, false} {
 		data, err := (&Server{Name: "s", OvpnDco: want}).MarshalJSON()
