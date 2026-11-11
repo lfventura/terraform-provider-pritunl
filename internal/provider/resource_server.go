@@ -418,7 +418,7 @@ func resourceServer() *schema.Resource {
 				Type:        schema.TypeBool,
 				Optional:    true,
 				Default:     false,
-				Description: "Enable OpenVPN Data Channel Offload, Pritunl's \"Data Channel Offload (Beta)\" option: the data channel runs in the kernel module `ovpn` or `ovpn-dco-v2`, which Pritunl loads when the server starts, and the server uses only the AEAD form of `cipher` (the CBC choices become their GCM counterparts). Every host of the server needs OpenVPN built with DCO and one of those modules; without them OpenVPN runs the data channel in user space. Not allowed with `cipher = \"none\"`. Changing it restarts the server, as every change to this resource does.",
+				Description: "Enable OpenVPN Data Channel Offload, Pritunl's \"Data Channel Offload (Beta)\" option: the data channel runs in the kernel module `ovpn` or `ovpn-dco-v2`, which Pritunl loads when the server starts, and the server uses only the AEAD form of `cipher` (the CBC choices become their GCM counterparts). Every host of the server needs OpenVPN built with DCO and one of those modules; without them OpenVPN runs the data channel in user space. Not allowed with `cipher = \"none\"`. The option exists from Pritunl 1.32.4567.52; on an older instance, an apply that turns it on fails. Changing it restarts the server, as every change to this resource does.",
 			},
 			"organization_ids": {
 				Type: schema.TypeList,
@@ -814,6 +814,10 @@ func resourceCreateServer(ctx context.Context, d *schema.ResourceData, meta inte
 		}
 	}
 
+	if err := checkOvpnDcoTaken(apiClient, d.Id(), d.Get("ovpn_dco").(bool)); err != nil {
+		return diag.FromErr(err)
+	}
+
 	return resourceReadServer(ctx, d, meta)
 }
 
@@ -1127,6 +1131,12 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 		}
 	}
 
+	if d.HasChange("ovpn_dco") {
+		if err := checkOvpnDcoTaken(apiClient, d.Id(), d.Get("ovpn_dco").(bool)); err != nil {
+			return diag.FromErr(err)
+		}
+	}
+
 	return resourceReadServer(ctx, d, meta)
 }
 
@@ -1152,6 +1162,23 @@ func customizeDiffServer(_ context.Context, d *schema.ResourceDiff, _ interface{
 func validateOvpnDco(ovpnDco bool, cipher string) error {
 	if ovpnDco && cipher == "none" {
 		return fmt.Errorf("ovpn_dco = true requires a cipher: the data channel offload does not run with cipher = \"none\"")
+	}
+	return nil
+}
+
+// checkOvpnDcoTaken reads the server back after a write that turned the data
+// channel offload on: a Pritunl without the option ignores the key and keeps
+// it off.
+func checkOvpnDcoTaken(apiClient pritunl.Client, serverId string, want bool) error {
+	if !want {
+		return nil
+	}
+	server, err := apiClient.GetServer(serverId)
+	if err != nil {
+		return err
+	}
+	if !server.OvpnDco {
+		return fmt.Errorf("Pritunl did not keep ovpn_dco = true: the instance has no Data Channel Offload option, which Pritunl has from version 1.32.4567.52")
 	}
 	return nil
 }

@@ -2,6 +2,7 @@ package provider
 
 import (
 	"fmt"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -406,6 +407,23 @@ func TestAccPritunlServer(t *testing.T) {
 
 	t.Run("ovpn_dco turns on, turns off and needs a cipher", func(t *testing.T) {
 		serverName := "tfacc-server-dco"
+
+		if !testPritunlHasOvpnDco(t) {
+			// a Pritunl older than the option ignores the key: the apply
+			// fails instead of leaving a diff that never converges
+			resource.Test(t, resource.TestCase{
+				PreCheck:          func() { preCheck(t) },
+				ProviderFactories: providerFactories,
+				CheckDestroy:      testPritunlServerDestroy,
+				Steps: []resource.TestStep{
+					{
+						Config:      testPritunlServerConfigWithOvpnDco(serverName, true, "aes256"),
+						ExpectError: regexp.MustCompile(`Pritunl did not keep ovpn_dco = true`),
+					},
+				},
+			})
+			return
+		}
 
 		resource.Test(t, resource.TestCase{
 			PreCheck:          func() { preCheck(t) },
@@ -837,6 +855,37 @@ func testPritunlServerConfigWithOvpnDco(name string, ovpnDco bool, cipher string
 			ovpn_dco = %[2]v
 		}
 	`, name, ovpnDco, cipher)
+}
+
+// testPritunlHasOvpnDco tells whether the instance under test has the Data
+// Channel Offload option: it creates a server with the option on, reads it
+// back and deletes it.
+func testPritunlHasOvpnDco(t *testing.T) bool {
+	t.Helper()
+	if os.Getenv(resource.EnvTfAcc) == "" {
+		t.Skipf("acceptance tests skipped unless env '%s' set", resource.EnvTfAcc)
+	}
+	preCheck(t)
+	server, err := testClient.CreateServer(map[string]interface{}{
+		"name":     "tfacc-dco-probe",
+		"protocol": "udp",
+		"cipher":   "aes256",
+		"hash":     "sha1",
+		"ovpn_dco": true,
+	})
+	if err != nil {
+		t.Fatalf("probe server: %s", err)
+	}
+	defer func() {
+		if err := testClient.DeleteServer(server.ID); err != nil {
+			t.Errorf("probe server cleanup: %s", err)
+		}
+	}()
+	read, err := testClient.GetServer(server.ID)
+	if err != nil {
+		t.Fatalf("probe server: %s", err)
+	}
+	return read.OvpnDco
 }
 
 // testPritunlServerLiveOvpnDco reads the server from the API, so a value the
