@@ -8,6 +8,9 @@ import (
 const (
 	ServerStatusOnline  = "online"
 	ServerStatusOffline = "offline"
+	// ServerStatusPending is what Pritunl reports while the DH parameters of
+	// a new server are generated
+	ServerStatusPending = "pending"
 
 	ServerNetworkModeTunnel = "tunnel"
 	ServerNetworkModeBridge = "bridge"
@@ -61,7 +64,10 @@ type Server struct {
 	JumboFrames      bool     `json:"jumbo_frames,omitempty"`
 	Debug            bool     `json:"debug,omitempty"`
 	GeoSort          bool     `json:"geo_sort,omitempty"`
-	Status           string   `json:"status,omitempty"`
+	// OvpnDco is always written, so every request states the offload; a key
+	// the request leaves out reaches the backend as false through pritunl-web
+	OvpnDco bool   `json:"ovpn_dco"`
+	Status  string `json:"status,omitempty"`
 }
 
 func (s *Server) MarshalJSON() ([]byte, error) {

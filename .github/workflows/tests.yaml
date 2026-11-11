@@ -6,13 +6,26 @@ on:
   pull_request:
     branches: [ master ]
 
+permissions:
+  contents: read
+
 jobs:
   tests:
-    name: Tests
+    name: Tests (Pritunl ${{ matrix.pritunl }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # ovpn_dco tells the tests whether the version has the server option
+        # ovpn_dco, which Pritunl has from 1.32.4567.52
+        include:
+          - pritunl: "1.32.4469.94"
+            ovpn_dco: "false"
+          - pritunl: "1.34.4763.45"
+            ovpn_dco: "true"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version: 1.25
-      - run: make test
+      - run: make test PRITUNL_IMAGE=ghcr.io/jippi/docker-pritunl:${{ matrix.pritunl }} PRITUNL_OVPN_DCO=${{ matrix.ovpn_dco }}

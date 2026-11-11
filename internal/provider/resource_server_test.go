@@ -2,6 +2,7 @@ package provider
 
 import (
 	"fmt"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -404,6 +405,56 @@ func TestAccPritunlServer(t *testing.T) {
 		})
 	})
 
+	t.Run("ovpn_dco turns on, turns off and needs a cipher", func(t *testing.T) {
+		serverName := "tfacc-server-dco"
+
+		if !testPritunlHasOvpnDco(t) {
+			// a Pritunl older than the option ignores the key: the apply
+			// fails instead of leaving a diff that never converges
+			resource.Test(t, resource.TestCase{
+				PreCheck:          func() { preCheck(t) },
+				ProviderFactories: providerFactories,
+				CheckDestroy:      testPritunlServerDestroy,
+				Steps: []resource.TestStep{
+					{
+						Config:      testPritunlServerConfigWithOvpnDco(serverName, true, "aes256"),
+						ExpectError: regexp.MustCompile(`Pritunl did not keep ovpn_dco = true`),
+					},
+				},
+			})
+			return
+		}
+
+		resource.Test(t, resource.TestCase{
+			PreCheck:          func() { preCheck(t) },
+			ProviderFactories: providerFactories,
+			CheckDestroy:      testPritunlServerDestroy,
+			Steps: []resource.TestStep{
+				{
+					Config: testPritunlServerConfigWithOvpnDco(serverName, true, "aes256"),
+					Check: resource.ComposeTestCheckFunc(
+						resource.TestCheckResourceAttr("pritunl_server.test", "ovpn_dco", "true"),
+						testPritunlServerLiveOvpnDco("pritunl_server.test", true),
+					),
+				},
+				importStep("pritunl_server.test"),
+				{
+					// turned off, checked against the API and not only
+					// against the state
+					Config: testPritunlServerConfigWithOvpnDco(serverName, false, "aes256"),
+					Check: resource.ComposeTestCheckFunc(
+						resource.TestCheckResourceAttr("pritunl_server.test", "ovpn_dco", "false"),
+						testPritunlServerLiveOvpnDco("pritunl_server.test", false),
+					),
+				},
+				{
+					Config:      testPritunlServerConfigWithOvpnDco(serverName, true, "none"),
+					ExpectError: regexp.MustCompile(`ovpn_dco = true requires a cipher`),
+				},
+			},
+		})
+	})
+
 	t.Run("creates a server with an attached organization", func(t *testing.T) {
 		serverName := "tfacc-server1"
 		orgName := "tfacc-org1"
@@ -794,6 +845,87 @@ func testPritunlServerConfigWithGeoSort(name string, geoSort bool) string {
 			geo_sort = %[2]v
 		}
 	`, name, geoSort)
+}
+
+func testPritunlServerConfigWithOvpnDco(name string, ovpnDco bool, cipher string) string {
+	return fmt.Sprintf(`
+		resource "pritunl_server" "test" {
+			name     = "%[1]s"
+			cipher   = "%[3]s"
+			ovpn_dco = %[2]v
+		}
+	`, name, ovpnDco, cipher)
+}
+
+// testPritunlHasOvpnDco tells whether the instance under test has the Data
+// Channel Offload option. PRITUNL_OVPN_DCO, when set, states it: the probe
+// shares CreateServer with the resource, so a CreateServer that drops the
+// field would otherwise make an instance with the option look like one
+// without it. Unset, the probe answers alone.
+func testPritunlHasOvpnDco(t *testing.T) bool {
+	t.Helper()
+	probed := testPritunlProbeOvpnDco(t)
+	expected := os.Getenv("PRITUNL_OVPN_DCO")
+	if expected == "" {
+		return probed
+	}
+	want, err := strconv.ParseBool(expected)
+	if err != nil {
+		t.Fatalf("PRITUNL_OVPN_DCO=%q is not a boolean", expected)
+	}
+	if probed != want {
+		t.Fatalf("PRITUNL_OVPN_DCO=%v, but a server created with ovpn_dco = true reads back %v", want, probed)
+	}
+	return want
+}
+
+// testPritunlProbeOvpnDco creates a server with the option on, reads it back
+// and deletes it.
+func testPritunlProbeOvpnDco(t *testing.T) bool {
+	t.Helper()
+	if os.Getenv(resource.EnvTfAcc) == "" {
+		t.Skipf("acceptance tests skipped unless env '%s' set", resource.EnvTfAcc)
+	}
+	preCheck(t)
+	server, err := testClient.CreateServer(map[string]interface{}{
+		"name":     "tfacc-dco-probe",
+		"protocol": "udp",
+		"cipher":   "aes256",
+		"hash":     "sha1",
+		"ovpn_dco": true,
+	})
+	if err != nil {
+		t.Fatalf("probe server: %s", err)
+	}
+	defer func() {
+		if err := testClient.DeleteServer(server.ID); err != nil {
+			t.Errorf("probe server cleanup: %s", err)
+		}
+	}()
+	read, err := testClient.GetServer(server.ID)
+	if err != nil {
+		t.Fatalf("probe server: %s", err)
+	}
+	return read.OvpnDco
+}
+
+// testPritunlServerLiveOvpnDco reads the server from the API, so a value the
+// provider stored without Pritunl taking it fails the check.
+func testPritunlServerLiveOvpnDco(name string, want bool) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources[name]
+		if !ok {
+			return fmt.Errorf("%s is not in the state", name)
+		}
+		server, err := testClient.GetServer(rs.Primary.ID)
+		if err != nil {
+			return err
+		}
+		if server.OvpnDco != want {
+			return fmt.Errorf("ovpn_dco in Pritunl is %v, want %v", server.OvpnDco, want)
+		}
+		return nil
+	}
 }
 
 func testPritunlServerConfigWithAttachedOrganization(name, organizationName string) string {

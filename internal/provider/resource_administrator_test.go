@@ -416,6 +416,10 @@ func TestAccPritunlAdministrator(t *testing.T) {
 	t.Run("explains why the last super user cannot be destroyed", func(t *testing.T) {
 		username := "tfacc-admin-protected"
 
+		if !testPritunlGuardCountsDisabledSuperUser(t) {
+			t.Skip("this Pritunl counts the other enabled super users when an administrator is deleted, so the guard is only reached by destroying the account the suite authenticates as")
+		}
+
 		resource.Test(t, resource.TestCase{
 			PreCheck:          func() { preCheck(t) },
 			ProviderFactories: providerFactories,
@@ -705,6 +709,43 @@ func configureAdministratorOutOfBand(t *testing.T, username string) {
 	if err = testClient.UpdateAdministrator(id, administrator); err != nil {
 		t.Fatalf("failed to configure the administrator out of band: %s", err)
 	}
+}
+
+// testPritunlGuardCountsDisabledSuperUser tells whether the instance refuses
+// to delete a disabled super user while the seeded account is the only other
+// super user, the way the destroy protection case reaches the guard. Pritunl
+// 1.34 counts the other enabled super users instead, so the seeded account
+// lets the deletion through. The probe account is removed either way.
+func testPritunlGuardCountsDisabledSuperUser(t *testing.T) bool {
+	t.Helper()
+	if os.Getenv("TF_ACC") == "" {
+		t.Skip("TF_ACC is not set, skipping the acceptance test")
+	}
+	preCheck(t)
+
+	created, err := testClient.CreateAdministrator(pritunl.Administrator{
+		"username":   "tfacc-admin-guard-probe",
+		"password":   "tfacc-Passw0rd!",
+		"super_user": true,
+		"disabled":   true,
+	})
+	if err != nil {
+		t.Fatalf("probe administrator: %s", err)
+	}
+	id := created.String("id")
+
+	if err := testClient.DeleteAdministrator(id); err == nil {
+		return false
+	}
+
+	created["disabled"] = false
+	if err := testClient.UpdateAdministrator(id, created); err != nil {
+		t.Fatalf("probe administrator cleanup: %s", err)
+	}
+	if err := testClient.DeleteAdministrator(id); err != nil {
+		t.Fatalf("probe administrator cleanup: %s", err)
+	}
+	return true
 }
 
 // deleteAdministratorOutOfBand removes the account straight through the API,

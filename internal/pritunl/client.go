@@ -416,6 +416,10 @@ func (c client) CreateServer(serverData map[string]interface{}) (*Server, error)
 		serverStruct.GeoSort = v.(bool)
 	}
 
+	if v, ok := serverData["ovpn_dco"]; ok {
+		serverStruct.OvpnDco = v.(bool)
+	}
+
 	if v, ok := serverData["restrict_routes"]; ok {
 		serverStruct.RestrictRoutes = v.(bool)
 	}

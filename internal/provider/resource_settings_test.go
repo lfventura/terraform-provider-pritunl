@@ -870,7 +870,7 @@ func testAccCheckSettingsValues(expected map[string]interface{}) resource.TestCh
 		}
 
 		for key, value := range expected {
-			if fmt.Sprintf("%v", settings[key]) != fmt.Sprintf("%v", value) {
+			if !settingValueMatches(key, fmt.Sprintf("%v", settings[key]), fmt.Sprintf("%v", value)) {
 				return fmt.Errorf("the setting %q of the pritunl instance is %v, want %v",
 					key, settings[key], value)
 			}
@@ -962,11 +962,27 @@ func sortedKeys(values map[string]interface{}) []string {
 func testAccCheckSettingsAttributes(values map[string]interface{}) resource.TestCheckFunc {
 	checks := make([]resource.TestCheckFunc, 0, len(values))
 	for _, key := range sortedKeys(values) {
-		checks = append(checks, resource.TestCheckResourceAttr(
-			"pritunl_settings.test", key, fmt.Sprintf("%v", values[key])))
+		key, want := key, fmt.Sprintf("%v", values[key])
+		checks = append(checks, resource.TestCheckResourceAttrWith(
+			"pritunl_settings.test", key, func(got string) error {
+				if !settingValueMatches(key, got, want) {
+					return fmt.Errorf("got %q, want %q", got, want)
+				}
+				return nil
+			}))
 	}
 
 	return resource.ComposeTestCheckFunc(checks...)
+}
+
+// settingValueMatches compares a setting the way the provider does:
+// server_sso_url by its ssoURLKey, since Pritunl releases store it in
+// different forms, every other setting as it is.
+func settingValueMatches(key, got, want string) bool {
+	if key == "server_sso_url" {
+		return ssoURLKey(got) == ssoURLKey(want)
+	}
+	return got == want
 }
 
 // Pritunl never lets auditing be turned off once it is on, so this test leaves
