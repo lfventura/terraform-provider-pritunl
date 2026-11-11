@@ -3,12 +3,12 @@
 page_title: "pritunl_server Resource - terraform-provider-pritunl"
 subcategory: ""
 description: |-
-  The organization resource allows managing information about a particular Pritunl server.
+  The server resource manages a Pritunl VPN server. Applying a change to a running server stops it, applies the change and starts it again. The calls that finish the update, each on a fresh connection, retry transient failures (network errors, every HTTP 5xx status) within one `restart_retry_timeout` window of the provider, and the start retries within a window of its own, so the server comes back online even when the client loses its path to the API while the server is stopped. When a step fails and the server is meant to be online, the server is started again before the error is returned.
 ---
 
 # pritunl_server (Resource)
 
-The organization resource allows managing information about a particular Pritunl server.
+The server resource manages a Pritunl VPN server. Applying a change to a running server stops it, applies the change and starts it again. The calls that finish the update, each on a fresh connection, retry transient failures (network errors, every HTTP 5xx status) within one `restart_retry_timeout` window of the provider, and the start retries within a window of its own, so the server comes back online even when the client loses its path to the API while the server is stopped. When a step fails and the server is meant to be online, the server is started again before the error is returned.
 
 
 

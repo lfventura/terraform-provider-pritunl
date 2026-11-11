@@ -1,6 +1,7 @@
 package pritunl
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/md5"
 	"crypto/sha256"
@@ -22,6 +23,11 @@ type transport struct {
 	apiToken            string
 	apiSecret           string
 	baseUrl             string
+
+	// single makes every request one attempt: the caller owns the retries.
+	single bool
+	// ctx, when set, bounds every request this transport sends.
+	ctx context.Context
 }
 
 const (
@@ -46,6 +52,10 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		u.Path = path.Join(u.Path, req.URL.Path)
 		req.URL = u
+	}
+
+	if t.ctx != nil {
+		req = req.WithContext(t.ctx)
 	}
 
 	deadline := time.Now().Add(transportRetryWindow)
@@ -73,7 +83,7 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			retriable = isDialError(err)
 		}
 		replayable := req.Body == nil || req.GetBody != nil
-		if !retriable || !replayable || time.Now().After(deadline) {
+		if t.single || !retriable || !replayable || time.Now().After(deadline) {
 			return resp, err
 		}
 		if err == nil {

@@ -87,6 +87,7 @@ resource "pritunl_server" "test" {
 
 - `connection_check` (Boolean) Whether to verify the connection to the Pritunl API when the provider is configured. Defaults to `true`; also taken from the `PRITUNL_CONNECTION_CHECK` environment variable.
 - `insecure` (Boolean) Whether to skip the TLS verification of the Pritunl API endpoint, for instances still running on a self-signed certificate. Defaults to `false`; also taken from the `PRITUNL_INSECURE` environment variable.
+- `restart_retry_timeout` (String) How long the calls that bring a stopped `pritunl_server` back keep retrying transient failures (network errors and every HTTP 5xx status), each retry on a fresh connection, as a Go duration greater than zero such as `90s`. The calls that finish an update share one window, the start has a window of its own, and no attempt outlives its window. Defaults to `1m`; also taken from the `PRITUNL_RESTART_RETRY_TIMEOUT` environment variable.
 - `secret` (String) The API secret of the administrator account the provider authenticates as. Also taken from the `PRITUNL_SECRET` environment variable.
 - `token` (String) The API token of the administrator account the provider authenticates as. Also taken from the `PRITUNL_TOKEN` environment variable.
 - `url` (String) The URL of the Pritunl instance, as in `https://vpn.example.com`. Also taken from the `PRITUNL_URL` environment variable.

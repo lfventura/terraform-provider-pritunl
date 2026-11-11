@@ -36,6 +36,13 @@ func Provider() *schema.Provider {
 				Optional:    true,
 				DefaultFunc: schema.EnvDefaultFunc("PRITUNL_CONNECTION_CHECK", true),
 			},
+			"restart_retry_timeout": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				Description:  restartRetryTimeoutDescription,
+				DefaultFunc:  schema.EnvDefaultFunc("PRITUNL_RESTART_RETRY_TIMEOUT", "1m"),
+				ValidateFunc: validateRestartRetryTimeout,
+			},
 		},
 		ResourcesMap: map[string]*schema.Resource{
 			"pritunl_administrator": resourceAdministrator(),
@@ -61,15 +68,20 @@ func providerConfigure(ctx context.Context, d *schema.ResourceData) (interface{}
 	insecure := d.Get("insecure").(bool)
 	connectionCheck := d.Get("connection_check").(bool)
 
+	restartRetryTimeout, err := parseRestartRetryTimeout(d.Get("restart_retry_timeout").(string))
+	if err != nil {
+		return nil, diag.FromErr(err)
+	}
+
 	apiClient := pritunl.NewClient(url, token, secret, insecure)
 
 	if connectionCheck {
 		// execute test api call to ensure that provided credentials are valid and pritunl api works
-		err := apiClient.TestApiCall()
+		err = apiClient.TestApiCall()
 		if err != nil {
 			return nil, diag.FromErr(err)
 		}
 	}
 
-	return apiClient, nil
+	return &providerMeta{Client: apiClient, restartRetryTimeout: restartRetryTimeout}, nil
 }
