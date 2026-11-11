@@ -4,6 +4,9 @@ build:
 
 # Pritunl the acceptance tests run against; the CI runs every version of its matrix
 PRITUNL_IMAGE ?= ghcr.io/jippi/docker-pritunl:1.32.4469.94
+# Whether that version has the server option ovpn_dco ("true" or "false");
+# empty lets the tests ask the instance
+PRITUNL_OVPN_DCO ?=
 
 .PHONY: test
 test:
@@ -36,6 +39,7 @@ test:
 	PRITUNL_INSECURE="true" \
 	PRITUNL_TOKEN=tfacctest_token \
 	PRITUNL_SECRET=tfacctest_secret \
+	PRITUNL_OVPN_DCO="$(PRITUNL_OVPN_DCO)" \
 	go test -v -cover -count 1 ./internal/provider
 
 	@docker rm tf_pritunl_acc_test -f

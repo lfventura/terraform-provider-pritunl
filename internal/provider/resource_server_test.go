@@ -858,9 +858,30 @@ func testPritunlServerConfigWithOvpnDco(name string, ovpnDco bool, cipher string
 }
 
 // testPritunlHasOvpnDco tells whether the instance under test has the Data
-// Channel Offload option: it creates a server with the option on, reads it
-// back and deletes it.
+// Channel Offload option. PRITUNL_OVPN_DCO, when set, states it: the probe
+// shares CreateServer with the resource, so a CreateServer that drops the
+// field would otherwise make an instance with the option look like one
+// without it. Unset, the probe answers alone.
 func testPritunlHasOvpnDco(t *testing.T) bool {
+	t.Helper()
+	probed := testPritunlProbeOvpnDco(t)
+	expected := os.Getenv("PRITUNL_OVPN_DCO")
+	if expected == "" {
+		return probed
+	}
+	want, err := strconv.ParseBool(expected)
+	if err != nil {
+		t.Fatalf("PRITUNL_OVPN_DCO=%q is not a boolean", expected)
+	}
+	if probed != want {
+		t.Fatalf("PRITUNL_OVPN_DCO=%v, but a server created with ovpn_dco = true reads back %v", want, probed)
+	}
+	return want
+}
+
+// testPritunlProbeOvpnDco creates a server with the option on, reads it back
+// and deletes it.
+func testPritunlProbeOvpnDco(t *testing.T) bool {
 	t.Helper()
 	if os.Getenv(resource.EnvTfAcc) == "" {
 		t.Skipf("acceptance tests skipped unless env '%s' set", resource.EnvTfAcc)
