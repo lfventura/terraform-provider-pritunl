@@ -2,8 +2,10 @@ package provider
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"math/big"
 	"regexp"
 	"strings"
 	"unicode"
@@ -31,6 +33,16 @@ const administratorYubikeyIdLength = 12
 // takes a username as well, and this is what tells the two apart.
 var administratorObjectIdPattern = regexp.MustCompile(`^[0-9a-fA-F]{24}$`)
 
+// The password generated for an account created without one: its length, and
+// the three kinds of characters it draws from. The symbols are the ones that
+// travel through a JSON body, a shell and a form field unchanged.
+const (
+	administratorGeneratedPasswordLength = 40
+	administratorPasswordLetters         = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	administratorPasswordDigits          = "0123456789"
+	administratorPasswordSymbols         = "-_.!@#%^*+=?"
+)
+
 // The flags of an administrator. They share the overlay, the create body and
 // the read because they all behave the same way, and because a boolean is the
 // one kind of value the overlay cannot decide on with d.Get alone, see
@@ -48,20 +60,21 @@ func resourceAdministrator() *schema.Resource {
 		Description: "The administrator resource allows managing the administrator accounts of a Pritunl instance, the logins of its web console and of its API. They have nothing to do with `pritunl_user`, which manages the VPN profiles of the end users inside an organization: an administrator is not a member of an organization and cannot connect to a VPN server, it operates Pritunl itself.\n\n" +
 			"**Every request behind this resource requires the credentials configured on the `pritunl` provider to belong to a super user.** `GET`, `POST`, `PUT` and `DELETE` on `/admin` are all refused with a `400 requires_super_user` otherwise, so the resource is unusable with an administrator that only holds API access.\n\n" +
 			"Every write is a read-modify-write of the complete administrator object, the same way the Pritunl web console itself works: `PUT /admin/<id>` is a full replace and not a partial update, and a request that leaves a field out has that field reset rather than kept. A rename alone is enough to strip the super user flag off an account, turn its API access off and rotate the API credentials that come with it, so the account is read back from the instance immediately before each write and handed over again with the managed attributes overlaid on top of it.\n\n" +
+			"An account that already exists under the configured username is adopted rather than refused: creating the resource converges it to the configuration the same way an import followed by an update does, and the password of an adopted account is only written when one is configured.\n\n" +
 			"Take care when the account managed here is the very one the `pritunl` provider authenticates as: setting `auth_api = false` or `disabled = true` on it revokes the credentials Terraform is holding, and every later request of the same run, the refresh of this resource included, fails with a `401`.",
 		Schema: map[string]*schema.Schema{
 			"username": {
 				Type:        schema.TypeString,
 				Required:    true,
 				StateFunc:   administratorUsernameStateFunc,
-				Description: "The login of the administrator. Pritunl normalises it before storing it, dropping every character that is neither a letter, a digit nor one of `-=_@.:/!#$&*+?^|~` and lowercasing the rest, and the configured value is normalised the same way so that it keeps matching what the API reports back. Usernames are unique, Pritunl answers a duplicate with a `400 admin_username_exists`.",
+				Description: "The login of the administrator. Pritunl normalises it before storing it, dropping every character that is neither a letter, a digit nor one of `-=_@.:/!#$&*+?^|~` and lowercasing the rest, and the configured value is normalised the same way so that it keeps matching what the API reports back. Usernames are unique, Pritunl answers a duplicate with a `400 admin_username_exists`, and creating the resource for a username that already exists adopts that account.",
 			},
 			"password": {
 				Type:      schema.TypeString,
 				Optional:  true,
 				Sensitive: true,
-				Description: "The password of the administrator. It is required to create one and optional afterwards: `GET /admin/<id>` never returns a password, not even a hash, so the value is write-only and is treated exactly the way `server_key` and `sso_okta_token` are treated by `pritunl_settings`. It is never read back, which means it is neither refreshed nor populated on import, and the plan compares the configured value against the previously configured one rather than against the password the account actually holds.\n\n" +
-					"Leaving it out of an existing configuration keeps the password as it is instead of clearing it: the backend only takes a password over when the request carries a non-empty one.",
+				Description: "The password of the administrator. It is optional: when it is absent while the account is created, the provider generates a random one that nobody knows, sends it in the create request only and never stores it, so the attribute stays empty in the state and the password is set later, through the web console. `GET /admin/<id>` never returns a password, not even a hash, so the value is write-only and is treated exactly the way `server_key` and `sso_okta_token` are treated by `pritunl_settings`. It is never read back, which means it is neither refreshed nor populated on import, and the plan compares the configured value against the previously configured one rather than against the password the account actually holds.\n\n" +
+					"Leaving it out keeps the password as it is instead of clearing it, and an existing account that is adopted keeps its password when none is configured: the backend only takes a password over when the request carries a non-empty one.",
 			},
 			"yubikey_id": {
 				Type:        schema.TypeString,
@@ -149,25 +162,38 @@ func importAdministrator(ctx context.Context, d *schema.ResourceData, meta inter
 		return []*schema.ResourceData{d}, nil
 	}
 
-	apiClient := meta.(pritunl.Client)
+	username := administratorUsername(d.Id())
 
-	administrators, err := apiClient.GetAdministrators()
+	id, found, err := findAdministratorId(meta.(pritunl.Client), username)
 	if err != nil {
 		return nil, err
 	}
 
-	username := administratorUsername(d.Id())
+	if !found {
+		return nil, fmt.Errorf("no administrator named %q exists on this pritunl instance, "+
+			"an administrator is imported by its username or by the object id the api addresses it with", username)
+	}
+
+	d.SetId(id)
+
+	return []*schema.ResourceData{d}, nil
+}
+
+// findAdministratorId looks the id of an administrator up by its normalised
+// username among the administrators of the instance.
+func findAdministratorId(apiClient pritunl.Client, username string) (string, bool, error) {
+	administrators, err := apiClient.GetAdministrators()
+	if err != nil {
+		return "", false, err
+	}
 
 	for _, administrator := range administrators {
 		if administrator.String("username") == username {
-			d.SetId(administrator.String("id"))
-
-			return []*schema.ResourceData{d}, nil
+			return administrator.String("id"), true, nil
 		}
 	}
 
-	return nil, fmt.Errorf("no administrator named %q exists on this pritunl instance, "+
-		"an administrator is imported by its username or by the object id the api addresses it with", username)
+	return "", false, nil
 }
 
 // customizeAdministratorDiff refuses the pair of two-step authentication modes
@@ -317,14 +343,17 @@ func administratorConfiguredString(d *schema.ResourceData, key string) (string, 
 func resourceCreateAdministrator(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	apiClient := meta.(pritunl.Client)
 
+	// an account created without a password gets one nobody knows, which is
+	// sent in the request below and goes nowhere else: it is not set on the
+	// resource data, so it reaches neither the state nor a diagnostic
 	password := d.Get("password").(string)
 	if password == "" {
-		return diag.Diagnostics{{
-			Severity:      diag.Error,
-			Summary:       "A password is required to create an administrator",
-			Detail:        "Pritunl refuses an administrator without a password. The attribute is optional because the password is write-only and is never read back from the API, which is what makes it optional on every later apply, but creating the account needs one.",
-			AttributePath: cty.GetAttrPath("password"),
-		}}
+		generated, err := generateAdministratorPassword()
+		if err != nil {
+			return diag.Errorf("generating the password of the administrator failed: %s", err)
+		}
+
+		password = generated
 	}
 
 	// nothing to merge, the account does not exist yet: unlike the update, the
@@ -365,12 +394,85 @@ func resourceCreateAdministrator(ctx context.Context, d *schema.ResourceData, me
 
 	created, err := apiClient.CreateAdministrator(administrator)
 	if err != nil {
+		if isAdministratorUsernameExists(err) {
+			return adoptAdministrator(ctx, d, meta)
+		}
+
 		return administratorDiagnostics(err)
 	}
 
 	d.SetId(created.String("id"))
 
 	return resourceReadAdministrator(ctx, d, meta)
+}
+
+// adoptAdministrator takes over the account that already holds the configured
+// username and converges it to the configuration, which is what an import
+// followed by an update does.
+//
+// The password is only written when one is configured, see
+// overlayAdministrator: the create request that found the account carried a
+// generated one, and it was refused along with the rest of the request, so the
+// password of the account is untouched. The id is cleared again when anything
+// after the lookup fails: an account that was adopted halfway would be saved
+// as a tainted resource, and the next apply would destroy an account this
+// resource never created.
+func adoptAdministrator(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
+	username := administratorUsername(d.Get("username").(string))
+
+	id, found, err := findAdministratorId(meta.(pritunl.Client), username)
+	if err != nil {
+		return administratorDiagnostics(err)
+	}
+
+	if !found {
+		return diag.Errorf("pritunl reported that the administrator %q exists, but no such administrator is listed", username)
+	}
+
+	d.SetId(id)
+
+	diagnostics := resourceUpdateAdministrator(ctx, d, meta)
+	if diagnostics.HasError() {
+		d.SetId("")
+	}
+
+	return diagnostics
+}
+
+// isAdministratorUsernameExists reports whether Pritunl refused a create
+// because the username is already taken.
+func isAdministratorUsernameExists(err error) bool {
+	var apiError *pritunl.ApiError
+
+	return errors.As(err, &apiError) && apiError.StatusCode == 400 && apiError.Code == "admin_username_exists"
+}
+
+// generateAdministratorPassword returns a random password of the generated
+// length with at least one letter, one digit and one symbol, drawn from the
+// operating system's cryptographically secure source.
+func generateAdministratorPassword() (string, error) {
+	alphabet := administratorPasswordLetters + administratorPasswordDigits + administratorPasswordSymbols
+	limit := big.NewInt(int64(len(alphabet)))
+	password := make([]byte, administratorGeneratedPasswordLength)
+
+	for {
+		for i := range password {
+			index, err := rand.Int(rand.Reader, limit)
+			if err != nil {
+				return "", err
+			}
+
+			password[i] = alphabet[index.Int64()]
+		}
+
+		value := string(password)
+
+		if strings.ContainsAny(value, administratorPasswordLetters) &&
+			strings.ContainsAny(value, administratorPasswordDigits) &&
+			strings.ContainsAny(value, administratorPasswordSymbols) {
+			return value, nil
+		}
+	}
 }
 
 // Uses for importing
@@ -562,7 +664,8 @@ func administratorDiagnostics(err error) diag.Diagnostics {
 			"deleted with them."
 	case "admin_username_exists":
 		detail = "Usernames are unique across the administrators of the instance. Pick another one, or import the " +
-			"existing account with `terraform import pritunl_administrator.example <username>`."
+			"existing account with `terraform import pritunl_administrator.example <username>`. Creating the " +
+			"resource adopts an account of that name instead, so this answer reaches an operator on a rename only."
 	case "admin_invalid_otp":
 		detail = "An administrator authenticates either with an authenticator application (`otp_auth`) or with a " +
 			"code issued by the Pritunl instance (`local_otp_auth`), never with both."
