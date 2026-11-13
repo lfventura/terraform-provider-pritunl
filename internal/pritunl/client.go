@@ -146,27 +146,79 @@ func (c client) GetOrganizations() ([]Organization, error) {
 func (c client) CreateOrganization(name string) (*Organization, error) {
 	var jsonStr = []byte(`{"name": "` + name + `"}`)
 
-	url := "/organization"
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonStr))
-
-	resp, err := c.httpClient.Do(req)
+	known, err := c.organizationIdsByName(name)
 	if err != nil {
-		return nil, fmt.Errorf("CreateOrganization: Error on HTTP request: %s", err)
+		return nil, fmt.Errorf("CreateOrganization: %s", err)
 	}
-	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("Non-200 response on creating the organization\nbody=%s", body)
+	var created *Organization
+
+	result, adopted, err := retryCreate(
+		func() attemptResult {
+			return c.post("/organization", jsonStr)
+		},
+		func() (bool, error) {
+			live, err := c.GetOrganizations()
+			if err != nil {
+				return false, err
+			}
+
+			var ids []string
+			byId := map[string]Organization{}
+			for _, organization := range live {
+				if organization.Name == name {
+					ids = append(ids, organization.ID)
+					byId[organization.ID] = organization
+				}
+			}
+
+			id, found, err := pickCreated("organizations", name, newIds(known, ids))
+			if err != nil || !found {
+				return false, err
+			}
+			organization := byId[id]
+			created = &organization
+
+			return true, nil
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("CreateOrganization: %s", err)
+	}
+	if adopted {
+		return created, nil
+	}
+	if result.err != nil {
+		return nil, fmt.Errorf("CreateOrganization: Error on HTTP request: %s", result.err)
+	}
+	if result.status != 200 {
+		return nil, fmt.Errorf("Non-200 response on creating the organization\ncode=%d\nbody=%s", result.status, result.body)
 	}
 
 	var organization Organization
-	err = json.Unmarshal(body, &organization)
+	err = json.Unmarshal(result.body, &organization)
 	if err != nil {
-		return nil, fmt.Errorf("CreateOrganization: %s: %+v, name=%s, body=%s", err, organization, name, body)
+		return nil, fmt.Errorf("CreateOrganization: %s: %+v, name=%s, body=%s", err, organization, name, result.body)
 	}
 
 	return &organization, nil
+}
+
+// organizationIdsByName lists the ids of the organizations holding a name.
+func (c client) organizationIdsByName(name string) ([]string, error) {
+	organizations, err := c.GetOrganizations()
+	if err != nil {
+		return nil, err
+	}
+
+	var ids []string
+	for _, organization := range organizations {
+		if organization.Name == name {
+			ids = append(ids, organization.ID)
+		}
+	}
+
+	return ids, nil
 }
 
 func (c client) UpdateOrganization(id string, organization *Organization) error {
@@ -441,28 +493,94 @@ func (c client) CreateServer(serverData map[string]interface{}) (*Server, error)
 	}
 
 	jsonData, err := serverStruct.MarshalJSON()
-
-	url := "/server"
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-
-	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("CreateServer: Error on HTTP request: %s", err)
+		return nil, fmt.Errorf("CreateServer: Error on marshalling data: %s", err)
 	}
-	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("Non-200 response on creating the server\ncode=%d\nbody=%s", resp.StatusCode, body)
+	// Pritunl takes any number of servers under one name, so a create that
+	// failed transiently is recognised by the server that was not there before
+	// it was sent and holds what it asked for
+	known, err := c.serverIdsByName(serverStruct.Name)
+	if err != nil {
+		return nil, fmt.Errorf("CreateServer: %s", err)
+	}
+
+	var created *Server
+
+	result, adopted, err := retryCreate(
+		func() attemptResult {
+			return c.post("/server", jsonData)
+		},
+		func() (bool, error) {
+			servers, err := c.GetServers()
+			if err != nil {
+				return false, err
+			}
+
+			var live []string
+			for _, server := range servers {
+				if serverMatches(server, serverStruct) {
+					live = append(live, server.ID)
+				}
+			}
+
+			id, found, err := pickCreated("servers", serverStruct.Name, newIds(known, live))
+			if err != nil || !found {
+				return false, err
+			}
+
+			created, err = c.GetServer(id)
+
+			return err == nil, err
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("CreateServer: %s", err)
+	}
+	if adopted {
+		return created, nil
+	}
+	if result.err != nil {
+		return nil, fmt.Errorf("CreateServer: Error on HTTP request: %s", result.err)
+	}
+	if result.status != 200 {
+		return nil, fmt.Errorf("Non-200 response on creating the server\ncode=%d\nbody=%s", result.status, result.body)
 	}
 
 	var server Server
-	err = json.Unmarshal(body, &server)
+	err = json.Unmarshal(result.body, &server)
 	if err != nil {
 		return nil, fmt.Errorf("CreateServer: Error on unmarshalling http response: %s", err)
 	}
 
 	return &server, nil
+}
+
+// serverMatches reports whether a server of the instance is the one a create
+// asked for: the name, and the network, the port and the protocol wherever the
+// request fixed them (Pritunl picks them itself otherwise).
+func serverMatches(live, asked Server) bool {
+	return live.Name == asked.Name &&
+		(asked.Network == "" || live.Network == asked.Network) &&
+		(asked.Port == 0 || live.Port == asked.Port) &&
+		(asked.Protocol == "" || live.Protocol == asked.Protocol)
+}
+
+// serverIdsByName lists the ids of the servers holding a name.
+func (c client) serverIdsByName(name string) ([]string, error) {
+	servers, err := c.GetServers()
+	if err != nil {
+		return nil, err
+	}
+
+	var ids []string
+	for _, server := range servers {
+		if server.Name == name {
+			ids = append(ids, server.ID)
+		}
+	}
+
+	return ids, nil
 }
 
 func (c client) UpdateServer(id string, server *Server) error {
@@ -621,43 +739,92 @@ func (c client) GetRoutesByServer(serverId string) ([]Route, error) {
 }
 
 func (c client) AddRouteToServer(serverId string, route Route) error {
-	jsonData, err := json.Marshal(route)
+	return c.postRoutes("AddRouteToServer", serverId, fmt.Sprintf("/server/%s/route", serverId), route, []Route{route}, "adding a route to the server")
+}
 
-	url := fmt.Sprintf("/server/%s/route", serverId)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+func (c client) AddRoutesToServer(serverId string, routes []Route) error {
+	return c.postRoutes("AddRoutesToServer", serverId, fmt.Sprintf("/server/%s/routes", serverId), routes, routes, "adding routes to the server")
+}
 
-	resp, err := c.httpClient.Do(req)
+// postRoutes adds routes to a server. The call survives the web server
+// restarting under it: after a transient failure the routes of the server are
+// read back, and the request is sent again only for as long as some of the
+// routes sent are missing or hold other values than the ones sent. Pritunl
+// updates a route that already exists in place, so a repeated request never
+// leaves a duplicate either way.
+func (c client) postRoutes(operation, serverId, url string, payload interface{}, routes []Route, description string) error {
+	jsonData, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("AddRouteToServer: Error on HTTP request: %s", err)
+		return fmt.Errorf("%s: Error on marshalling data: %s", operation, err)
 	}
-	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("Non-200 response on adding a route to the server\nbody=%s", body)
+	result, adopted, err := retryCreate(
+		func() attemptResult {
+			return c.post(url, jsonData)
+		},
+		func() (bool, error) {
+			live, err := c.GetRoutesByServer(serverId)
+			if err != nil {
+				return false, err
+			}
+
+			return routesPresent(live, routes), nil
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("%s: %s", operation, err)
+	}
+	if adopted {
+		return nil
+	}
+	if result.err != nil {
+		return fmt.Errorf("%s: Error on HTTP request: %s", operation, result.err)
+	}
+	if result.status != 200 {
+		return fmt.Errorf("Non-200 response on %s\ncode=%d\nbody=%s", description, result.status, result.body)
 	}
 
 	return nil
 }
 
-func (c client) AddRoutesToServer(serverId string, routes []Route) error {
-	jsonData, err := json.Marshal(routes)
+// routesPresent reports whether every wanted route is among the live ones with
+// the very values it was sent with.
+func routesPresent(live, wanted []Route) bool {
+	liveByNetwork := make(map[string]Route, len(live))
+	for _, route := range live {
+		liveByNetwork[route.Network] = route
+	}
 
-	url := fmt.Sprintf("/server/%s/routes", serverId)
+	for _, want := range wanted {
+		got, found := liveByNetwork[want.Network]
+		if !found || got.Nat != want.Nat || got.NetGateway != want.NetGateway || got.Comment != want.Comment {
+			return false
+		}
+	}
+
+	return true
+}
+
+// post sends one POST request, with the status and the body of the answer, or
+// the transport error, handed back as they are.
+func (c client) post(url string, jsonData []byte) attemptResult {
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return attemptResult{err: fatalError{err}}
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("AddRoutesToServer: Error on HTTP request: %s", err)
+		return attemptResult{err: err}
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("Non-200 response on adding routes to the server\nbody=%s", body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return attemptResult{err: err}
 	}
 
-	return nil
+	return attemptResult{status: resp.StatusCode, body: body}
 }
 
 func (c client) UpdateRouteOnServer(serverId string, route Route) error {
@@ -735,24 +902,50 @@ func (c client) CreateUser(newUser User) (*User, error) {
 		return nil, fmt.Errorf("CreateUser: Error on marshalling data: %s", err)
 	}
 
-	url := fmt.Sprintf("/user/%s", newUser.Organization)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-
-	resp, err := c.httpClient.Do(req)
+	known, err := c.userIdsByName(newUser.Organization, newUser.Name)
 	if err != nil {
-		return nil, fmt.Errorf("CreateUser: Error on HTTP request: %s", err)
+		return nil, fmt.Errorf("CreateUser: %s", err)
 	}
-	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("Non-200 response on creating the user\ncode=%d\nbody=%s", resp.StatusCode, body)
+	var created *User
+
+	result, adopted, err := retryCreate(
+		func() attemptResult {
+			return c.post(fmt.Sprintf("/user/%s", newUser.Organization), jsonData)
+		},
+		func() (bool, error) {
+			live, err := c.userIdsByName(newUser.Organization, newUser.Name)
+			if err != nil {
+				return false, err
+			}
+
+			id, found, err := pickCreated("users", newUser.Name, newIds(known, live))
+			if err != nil || !found {
+				return false, err
+			}
+
+			created, err = c.GetUser(id, newUser.Organization)
+
+			return err == nil, err
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("CreateUser: %s", err)
+	}
+	if adopted {
+		return created, nil
+	}
+	if result.err != nil {
+		return nil, fmt.Errorf("CreateUser: Error on HTTP request: %s", result.err)
+	}
+	if result.status != 200 {
+		return nil, fmt.Errorf("Non-200 response on creating the user\ncode=%d\nbody=%s", result.status, result.body)
 	}
 
 	var users []User
-	err = json.Unmarshal(body, &users)
+	err = json.Unmarshal(result.body, &users)
 	if err != nil {
-		return nil, fmt.Errorf("CreateUser: Error on unmarshalling API response %s (body=%+v)", err, string(body))
+		return nil, fmt.Errorf("CreateUser: Error on unmarshalling API response %s (body=%+v)", err, string(result.body))
 	}
 
 	if len(users) > 0 {
@@ -760,6 +953,47 @@ func (c client) CreateUser(newUser User) (*User, error) {
 	}
 
 	return nil, fmt.Errorf("empty users response")
+}
+
+// userIdsByName lists the ids of the users of an organization holding a name.
+func (c client) userIdsByName(organizationId, name string) ([]string, error) {
+	req, err := http.NewRequest("GET", fmt.Sprintf("/user/%s", organizationId), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("Error on HTTP request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("Error on reading the users: %w", err)
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("Non-200 response on getting the users of the organization\ncode=%d\nbody=%s", resp.StatusCode, body)
+	}
+
+	// only what tells a user apart is decoded: the list carries far more than
+	// the user the provider manages
+	var users []struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(body, &users); err != nil {
+		return nil, fmt.Errorf("Error on unmarshalling the users: %s", err)
+	}
+
+	var ids []string
+	for _, user := range users {
+		if user.Name == name {
+			ids = append(ids, user.ID)
+		}
+	}
+
+	return ids, nil
 }
 
 func (c client) UpdateUser(id string, user *User) error {
@@ -1061,34 +1295,69 @@ func (c client) CreateAdministrator(administrator Administrator) (Administrator,
 		return nil, fmt.Errorf("CreateAdministrator: Error on marshalling data: %s", err)
 	}
 
-	url := "/admin"
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	// the username of an administrator is unique, so a create that failed
+	// transiently is settled by the account being there, unless it was there
+	// before the request was sent: that one is the answer of the API to give
+	username := administrator.String("username")
+	var created Administrator
 
-	resp, err := c.httpClient.Do(req)
+	existing, err := c.GetAdministrators()
 	if err != nil {
-		return nil, fmt.Errorf("CreateAdministrator: Error on HTTP request: %s", err)
+		return nil, fmt.Errorf("CreateAdministrator: %s", err)
 	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		return nil, newApiError("creating the administrator", resp.StatusCode, body)
+	for _, account := range existing {
+		if username != "" && account.String("username") == username {
+			username = ""
+		}
 	}
 
-	created := Administrator{}
+	result, adopted, err := retryCreate(
+		func() attemptResult {
+			return c.post("/admin", jsonData)
+		},
+		func() (bool, error) {
+			if username == "" {
+				return false, nil
+			}
 
-	if err = decodeAdministrators(body, &created); err != nil {
+			live, err := c.GetAdministrators()
+			if err != nil {
+				return false, err
+			}
+
+			for _, account := range live {
+				if account.String("username") == username {
+					created = account
+
+					return true, nil
+				}
+			}
+
+			return false, nil
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("CreateAdministrator: %s", err)
+	}
+	if adopted {
+		return created, nil
+	}
+	if result.err != nil {
+		return nil, fmt.Errorf("CreateAdministrator: Error on HTTP request: %s", result.err)
+	}
+	if result.status != 200 {
+		return nil, newApiError("creating the administrator", result.status, result.body)
+	}
+
+	created = Administrator{}
+
+	if err = decodeAdministrators(result.body, &created); err != nil {
 		return nil, fmt.Errorf("CreateAdministrator: Error on unmarshalling response: %s", err)
 	}
 
 	return created, nil
 }
 
-// UpdateAdministrator replaces the whole administrator account. PUT
-// /admin/<id> is a full replace, so the administrator handed over here has to
-// be the complete object read from GetAdministrator with the wanted changes
-// applied on top of it, otherwise every field missing from the body is reset,
-// the super user flag and the API access included.
 func (c client) UpdateAdministrator(id string, administrator Administrator) error {
 	administrator.normalize()
 
@@ -1179,23 +1448,27 @@ func (c client) ActivateSubscription(license string) error {
 		return err
 	}
 
-	req, err := http.NewRequest("POST", "/subscription", bytes.NewBuffer(jsonData))
+	// activating the same license again changes nothing, so a request the
+	// restart cut short is simply sent again
+	result, _, err := retryCreate(
+		func() attemptResult {
+			return c.post("/subscription", jsonData)
+		},
+		func() (bool, error) {
+			return false, nil
+		},
+	)
 	if err != nil {
 		return err
 	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("ActivateSubscription: Error on HTTP request: %s", err)
+	if result.err != nil {
+		return fmt.Errorf("ActivateSubscription: Error on HTTP request: %s", result.err)
 	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
+	if result.status != 200 {
 		// Pritunl validates the key against its subscription server and
 		// answers an invalid or unreachable one with a json error document
 		// (e.g. 470 license_invalid), reported here verbatim.
-		return fmt.Errorf("Non-200 response on activating the subscription\ncode=%d\nbody=%s", resp.StatusCode, body)
+		return fmt.Errorf("Non-200 response on activating the subscription\ncode=%d\nbody=%s", result.status, result.body)
 	}
 
 	return nil

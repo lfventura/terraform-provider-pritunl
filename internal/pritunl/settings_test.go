@@ -70,3 +70,20 @@ func TestSettingsSetAuditing(t *testing.T) {
 		})
 	}
 }
+
+// A number reads the same whether the API returned it or this provider wrote it.
+func TestSettingsInt(t *testing.T) {
+	settings := decodeSettings(t, `{"server_port": 8443}`)
+	if got := settings.Int("server_port"); got != 8443 {
+		t.Fatalf("a number read from the API: got %d, want 8443", got)
+	}
+
+	settings["server_port"] = 443
+	if got := settings.Int("server_port"); got != 443 {
+		t.Fatalf("a number written by the provider: got %d, want 443", got)
+	}
+
+	if got := settings.Int("absent"); got != 0 {
+		t.Fatalf("an absent setting: got %d, want 0", got)
+	}
+}
