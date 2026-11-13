@@ -1,11 +1,15 @@
 package provider
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/hashicorp/go-cty/cty"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
 	"github.com/lfventura/terraform-provider-pritunl/internal/pritunl"
 )
 
@@ -198,4 +202,477 @@ func administratorApiError(operation string, statusCode int, code, message, body
 	// the client hands the error over as it is, wrapping it here proves the
 	// diagnostics look through a wrapped one as well
 	return fmt.Errorf("the request failed: %w", err)
+}
+
+// administratorCreateClient is an instance holding a few administrators, as far
+// as the create of pritunl_administrator is concerned: it answers the calls
+// that path makes and panics on any other one through the nil embedded client.
+type administratorCreateClient struct {
+	pritunl.Client
+	accounts []pritunl.Administrator
+	created  []pritunl.Administrator
+	updated  []pritunl.Administrator
+	deleted  []string
+
+	// failures to inject: the nth call of GetAdministrator (1-based, 0 for
+	// none) and every call of UpdateAdministrator
+	failGetAt int
+	getCalls  int
+	updateErr error
+}
+
+func (c *administratorCreateClient) find(id string) pritunl.Administrator {
+	for _, account := range c.accounts {
+		if account.String("id") == id {
+			return account
+		}
+	}
+
+	return nil
+}
+
+func (c *administratorCreateClient) GetAdministrators() ([]pritunl.Administrator, error) {
+	return c.accounts, nil
+}
+
+func (c *administratorCreateClient) GetAdministrator(id string) (pritunl.Administrator, error) {
+	c.getCalls++
+
+	if c.failGetAt != 0 && c.getCalls == c.failGetAt {
+		return nil, errors.New("GetAdministrator: Error on HTTP request: connection refused")
+	}
+
+	if account := c.find(id); account != nil {
+		// a copy, the way a response is not the stored object
+		read := pritunl.Administrator{}
+		for key, value := range account {
+			read[key] = value
+		}
+
+		return read, nil
+	}
+
+	return nil, pritunl.ErrAdministratorNotFound
+}
+
+func (c *administratorCreateClient) CreateAdministrator(administrator pritunl.Administrator) (pritunl.Administrator, error) {
+	for _, account := range c.accounts {
+		if account.String("username") == administrator.String("username") {
+			return nil, administratorApiError("creating the administrator", 400, "admin_username_exists",
+				"Administrator username already exists.",
+				`{"error": "admin_username_exists", "error_msg": "Administrator username already exists."}`)
+		}
+	}
+
+	sent := pritunl.Administrator{}
+	for key, value := range administrator {
+		sent[key] = value
+	}
+
+	c.created = append(c.created, sent)
+
+	// the password is never part of what the instance reports
+	account := pritunl.Administrator{"id": "6a9b8b734f5041e3afd7a11b"}
+	for key, value := range administrator {
+		if key != "password" {
+			account[key] = value
+		}
+	}
+
+	c.accounts = append(c.accounts, account)
+
+	return account, nil
+}
+
+func (c *administratorCreateClient) DeleteAdministrator(id string) error {
+	c.deleted = append(c.deleted, id)
+
+	return nil
+}
+
+func (c *administratorCreateClient) UpdateAdministrator(id string, administrator pritunl.Administrator) error {
+	if c.updateErr != nil {
+		return c.updateErr
+	}
+
+	sent := pritunl.Administrator{}
+	for key, value := range administrator {
+		sent[key] = value
+	}
+
+	c.updated = append(c.updated, sent)
+
+	account := c.find(id)
+	for key, value := range administrator {
+		if key != "password" {
+			account[key] = value
+		}
+	}
+
+	return nil
+}
+
+// createAdministrator runs the create of the resource the way Terraform does,
+// with the configuration as the raw configuration of the diff, which is the
+// only place where an attribute written down is told from one left out.
+func createAdministrator(t *testing.T, client pritunl.Client, config map[string]cty.Value) (*terraform.InstanceState, error) {
+	t.Helper()
+
+	resource := resourceAdministrator()
+
+	raw := map[string]cty.Value{}
+	configured := map[string]interface{}{}
+
+	for name := range resource.Schema {
+		raw[name] = cty.NullVal(cty.String)
+	}
+
+	for _, name := range administratorBoolAttributes {
+		raw[name] = cty.NullVal(cty.Bool)
+	}
+
+	for name, value := range config {
+		raw[name] = value
+
+		switch value.Type() {
+		case cty.Bool:
+			configured[name] = value.True()
+		default:
+			configured[name] = value.AsString()
+		}
+	}
+
+	diff, err := resource.Diff(context.Background(), nil, terraform.NewResourceConfigRaw(configured), client)
+	if err != nil {
+		t.Fatalf("planning the administrator failed: %s", err)
+	}
+
+	diff.RawConfig = cty.ObjectVal(raw)
+
+	state, diagnostics := resource.Apply(context.Background(), nil, diff, client)
+	if diagnostics.HasError() {
+		return state, errors.New(diagnostics[0].Summary)
+	}
+
+	return state, nil
+}
+
+func TestCreateAdministratorWithoutPasswordGeneratesOne(t *testing.T) {
+	client := &administratorCreateClient{}
+
+	state, err := createAdministrator(t, client, map[string]cty.Value{
+		"username": cty.StringVal("operator"),
+	})
+	if err != nil {
+		t.Fatalf("expected the create to succeed, got %s", err)
+	}
+
+	if len(client.created) != 1 {
+		t.Fatalf("expected one create request, got %d", len(client.created))
+	}
+
+	sent := client.created[0].String("password")
+	if len(sent) < 32 {
+		t.Fatalf("expected a generated password of at least 32 characters, sent %d", len(sent))
+	}
+
+	if password := state.Attributes["password"]; password != "" {
+		t.Fatalf("expected the password to stay out of the state, got %d characters", len(password))
+	}
+
+	for key, value := range state.Attributes {
+		if sent != "" && strings.Contains(value, sent) {
+			t.Fatalf("the generated password reached the state attribute %q", key)
+		}
+	}
+
+	if len(client.updated) != 0 {
+		t.Fatalf("expected no update of a new account, got %d", len(client.updated))
+	}
+}
+
+func TestCreateAdministratorWithPasswordSendsIt(t *testing.T) {
+	client := &administratorCreateClient{}
+
+	state, err := createAdministrator(t, client, map[string]cty.Value{
+		"username": cty.StringVal("operator"),
+		"password": cty.StringVal("configured-secret"),
+	})
+	if err != nil {
+		t.Fatalf("expected the create to succeed, got %s", err)
+	}
+
+	if sent := client.created[0].String("password"); sent != "configured-secret" {
+		t.Fatalf("expected the configured password to be sent, sent %q", sent)
+	}
+
+	if password := state.Attributes["password"]; password != "configured-secret" {
+		t.Fatalf("expected the configured password in the state, got %q", password)
+	}
+}
+
+func TestGenerateAdministratorPassword(t *testing.T) {
+	seen := map[string]bool{}
+
+	for i := 0; i < 50; i++ {
+		password, err := generateAdministratorPassword()
+		if err != nil {
+			t.Fatalf("expected a password, got %s", err)
+		}
+
+		if len(password) < 32 {
+			t.Fatalf("expected at least 32 characters, got %d", len(password))
+		}
+
+		for _, class := range []string{administratorPasswordLetters, administratorPasswordDigits, administratorPasswordSymbols} {
+			if !strings.ContainsAny(password, class) {
+				t.Fatalf("expected a character of %q in the password", class)
+			}
+		}
+
+		if seen[password] {
+			t.Fatalf("expected passwords to differ, got a repeat")
+		}
+
+		seen[password] = true
+	}
+}
+
+func TestCreateAdministratorAdoptsAnExistingAccount(t *testing.T) {
+	client := &administratorCreateClient{
+		accounts: []pritunl.Administrator{{
+			"id":             "5f1b2a3c4d5e6f7a8b9c0d1e",
+			"username":       "operator",
+			"super_user":     false,
+			"auth_api":       false,
+			"disabled":       true,
+			"otp_auth":       false,
+			"local_otp_auth": false,
+			"yubikey_id":     "",
+			"theme":          "dark",
+		}},
+	}
+
+	state, err := createAdministrator(t, client, map[string]cty.Value{
+		"username":   cty.StringVal("Operator"),
+		"password":   cty.StringVal("configured-secret"),
+		"super_user": cty.BoolVal(true),
+		"auth_api":   cty.BoolVal(true),
+		"disabled":   cty.BoolVal(false),
+		"otp_auth":   cty.BoolVal(true),
+		"yubikey_id": cty.StringVal("ccccccbcdefgtrljvnvtdjhbvrhlchgcbeghdthflukj"),
+	})
+	if err != nil {
+		t.Fatalf("expected the create to adopt the account, got %s", err)
+	}
+
+	if state.ID != "5f1b2a3c4d5e6f7a8b9c0d1e" {
+		t.Fatalf("expected the id of the existing account, got %q", state.ID)
+	}
+
+	if len(client.created) != 0 || len(client.accounts) != 1 {
+		t.Fatalf("expected no second account, got %d created and %d held", len(client.created), len(client.accounts))
+	}
+
+	if len(client.updated) != 1 {
+		t.Fatalf("expected one update converging the account, got %d", len(client.updated))
+	}
+
+	updated := client.updated[0]
+
+	for attribute, want := range map[string]bool{"super_user": true, "auth_api": true, "disabled": false, "otp_auth": true, "local_otp_auth": false} {
+		if got := updated.Bool(attribute); got != want {
+			t.Errorf("expected %s=%t on the adopted account, sent %t", attribute, want, got)
+		}
+	}
+
+	if got := updated.String("yubikey_id"); got != "ccccccbcdefg" {
+		t.Errorf("expected the yubikey id to be converged, sent %q", got)
+	}
+
+	if got := updated.String("theme"); got != "dark" {
+		t.Errorf("expected what the resource does not manage to be handed back untouched, sent %q", got)
+	}
+
+	if got := updated.String("password"); got != "configured-secret" {
+		t.Errorf("expected the configured password to be written, sent %q", got)
+	}
+
+	if state.Attributes["super_user"] != "true" || state.Attributes["disabled"] != "false" {
+		t.Errorf("expected the state to hold the converged account, got %v", state.Attributes)
+	}
+}
+
+func TestCreateAdministratorAdoptsWithoutAPasswordWhenNoneIsConfigured(t *testing.T) {
+	client := &administratorCreateClient{
+		accounts: []pritunl.Administrator{{
+			"id":             "5f1b2a3c4d5e6f7a8b9c0d1e",
+			"username":       "operator",
+			"super_user":     true,
+			"auth_api":       false,
+			"disabled":       false,
+			"otp_auth":       false,
+			"local_otp_auth": false,
+		}},
+	}
+
+	state, err := createAdministrator(t, client, map[string]cty.Value{
+		"username":   cty.StringVal("operator"),
+		"auth_api":   cty.BoolVal(true),
+		"super_user": cty.BoolVal(true),
+	})
+	if err != nil {
+		t.Fatalf("expected the create to adopt the account, got %s", err)
+	}
+
+	if len(client.updated) != 1 {
+		t.Fatalf("expected one update, got %d", len(client.updated))
+	}
+
+	if client.updated[0].Has("password") {
+		t.Fatalf("expected no password to be sent for an adopted account")
+	}
+
+	if !client.updated[0].Bool("auth_api") {
+		t.Fatalf("expected auth_api to be converged")
+	}
+
+	if password := state.Attributes["password"]; password != "" {
+		t.Fatalf("expected the password to stay out of the state, got %d characters", len(password))
+	}
+}
+
+// An account that was adopted halfway must not be left behind in the state: a
+// resource saved with its id is tainted, and the next apply destroys it, an
+// account this resource never created. Each step after the lookup is made to
+// fail in turn, and the create has to report it and keep no id.
+func TestCreateAdministratorAdoptionFailureKeepsNoId(t *testing.T) {
+	forgetAdoptedAdministrators()
+
+	cases := []struct {
+		name   string
+		client func() *administratorCreateClient
+	}{
+		{
+			name: "the read before the update fails",
+			client: func() *administratorCreateClient {
+				return &administratorCreateClient{failGetAt: 1}
+			},
+		},
+		{
+			name: "the update is refused",
+			client: func() *administratorCreateClient {
+				return &administratorCreateClient{updateErr: administratorApiError("updating the administrator", 400, "something_else",
+					"Something else went wrong.",
+					`{"error": "something_else", "error_msg": "Something else went wrong."}`)}
+			},
+		},
+		{
+			name: "the refresh after the update fails",
+			client: func() *administratorCreateClient {
+				return &administratorCreateClient{failGetAt: 2}
+			},
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			client := testCase.client()
+			client.accounts = []pritunl.Administrator{{
+				"id":         "5f1b2a3c4d5e6f7a8b9c0d1e",
+				"username":   "operator",
+				"super_user": true,
+			}}
+
+			state, err := createAdministrator(t, client, map[string]cty.Value{
+				"username": cty.StringVal("operator"),
+			})
+			if err == nil {
+				t.Fatalf("expected the create to fail")
+			}
+
+			if state != nil && state.ID != "" {
+				t.Fatalf("expected no id in the state of a failed adoption, got %q", state.ID)
+			}
+
+			if _, adopted := administratorsAdopted.Load("5f1b2a3c4d5e6f7a8b9c0d1e"); adopted {
+				t.Fatalf("expected a failed adoption not to be remembered")
+			}
+		})
+	}
+}
+
+// The replacement of an administrator with create_before_destroy creates the
+// new instance, which adopts the account of the old one, before the old one is
+// destroyed. The destroy has to leave that account alone, and has to do so
+// only once: after a read the account is deleted as any other.
+func TestDeleteAdministratorLeavesAnAdoptedAccountAlone(t *testing.T) {
+	const id = "5f1b2a3c4d5e6f7a8b9c0d1e"
+
+	forgetAdoptedAdministrators()
+
+	client := &administratorCreateClient{
+		accounts: []pritunl.Administrator{{"id": id, "username": "operator"}},
+	}
+
+	state, err := createAdministrator(t, client, map[string]cty.Value{
+		"username": cty.StringVal("operator"),
+	})
+	if err != nil {
+		t.Fatalf("expected the create to adopt the account, got %s", err)
+	}
+
+	if state.ID != id {
+		t.Fatalf("expected the id of the existing account, got %q", state.ID)
+	}
+
+	resource := resourceAdministrator()
+	old := &terraform.InstanceState{ID: id, Attributes: map[string]string{"id": id, "username": "operator"}}
+
+	// the destroy of the old instance, in the same operation as the adoption
+	kept, diagnostics := resource.Apply(context.Background(), old, &terraform.InstanceDiff{Destroy: true}, client)
+	if diagnostics.HasError() {
+		t.Fatalf("expected the destroy to succeed, got %s", diagnostics[0].Summary)
+	}
+
+	if len(client.deleted) != 0 {
+		t.Fatalf("expected the adopted account to be left in place, deleted %v", client.deleted)
+	}
+
+	if kept != nil && kept.ID != "" {
+		t.Fatalf("expected the old instance to be dropped from the state, got %q", kept.ID)
+	}
+
+	if len(diagnostics) != 1 || diagnostics[0].Severity != diag.Warning {
+		t.Fatalf("expected one warning explaining it, got %v", diagnostics)
+	}
+
+	// a later operation of the same process: the account is read, then deleted
+	if _, adopted := administratorsAdopted.Load(id); adopted {
+		t.Fatalf("expected the account not to be remembered after the destroy")
+	}
+
+	administratorsAdopted.Store(id, struct{}{})
+
+	if diagnostics := resourceReadAdministrator(context.Background(), resource.Data(old), client); diagnostics.HasError() {
+		t.Fatalf("expected the read to succeed, got %s", diagnostics[0].Summary)
+	}
+
+	if _, diagnostics := resource.Apply(context.Background(), old, &terraform.InstanceDiff{Destroy: true}, client); diagnostics.HasError() {
+		t.Fatalf("expected the destroy to succeed, got %s", diagnostics[0].Summary)
+	}
+
+	if len(client.deleted) != 1 || client.deleted[0] != id {
+		t.Fatalf("expected the account to be deleted once it was read, deleted %v", client.deleted)
+	}
+}
+
+// the accounts adopted are remembered by the process, so a test that adopts
+// leaves one behind for the next
+func forgetAdoptedAdministrators() {
+	administratorsAdopted.Range(func(key, _ interface{}) bool {
+		administratorsAdopted.Delete(key)
+
+		return true
+	})
 }
