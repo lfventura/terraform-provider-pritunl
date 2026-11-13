@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"regexp"
 	"strings"
+	"sync"
 	"unicode"
 
 	"github.com/hashicorp/go-cty/cty"
@@ -43,6 +44,16 @@ const (
 	administratorPasswordSymbols         = "-_.!@#%^*+=?"
 )
 
+// The accounts this provider process adopted and has not read since. A
+// provider process lives for one Terraform operation, and a replacement with
+// create_before_destroy creates the new instance, which adopts the very
+// account the old one holds, before it destroys the old one: the destroy would
+// delete the account the new state is bound to. An account listed here is the
+// one a delete has to leave alone, see resourceDeleteAdministrator. A read
+// takes the account off the list, which is what keeps a later operation of the
+// same process, a test run or a long lived one, deleting it normally.
+var administratorsAdopted sync.Map
+
 // The flags of an administrator. They share the overlay, the create body and
 // the read because they all behave the same way, and because a boolean is the
 // one kind of value the overlay cannot decide on with d.Get alone, see
@@ -60,7 +71,7 @@ func resourceAdministrator() *schema.Resource {
 		Description: "The administrator resource allows managing the administrator accounts of a Pritunl instance, the logins of its web console and of its API. They have nothing to do with `pritunl_user`, which manages the VPN profiles of the end users inside an organization: an administrator is not a member of an organization and cannot connect to a VPN server, it operates Pritunl itself.\n\n" +
 			"**Every request behind this resource requires the credentials configured on the `pritunl` provider to belong to a super user.** `GET`, `POST`, `PUT` and `DELETE` on `/admin` are all refused with a `400 requires_super_user` otherwise, so the resource is unusable with an administrator that only holds API access.\n\n" +
 			"Every write is a read-modify-write of the complete administrator object, the same way the Pritunl web console itself works: `PUT /admin/<id>` is a full replace and not a partial update, and a request that leaves a field out has that field reset rather than kept. A rename alone is enough to strip the super user flag off an account, turn its API access off and rotate the API credentials that come with it, so the account is read back from the instance immediately before each write and handed over again with the managed attributes overlaid on top of it.\n\n" +
-			"An account that already exists under the configured username is adopted rather than refused: creating the resource converges it to the configuration the same way an import followed by an update does, and the password of an adopted account is only written when one is configured.\n\n" +
+			"An account that already exists under the configured username is adopted rather than refused: creating the resource converges it to the configuration the same way an import followed by an update does, and the password of an adopted account is only written when one is configured. Replacing an administrator, to rotate its credentials for instance, needs the default order, destroy first and create after: with `create_before_destroy` the replacement would adopt the very account being replaced, so the provider leaves that account in place when the old instance is destroyed and drops the instance from the state with a warning.\n\n" +
 			"Take care when the account managed here is the very one the `pritunl` provider authenticates as: setting `auth_api = false` or `disabled = true` on it revokes the credentials Terraform is holding, and every later request of the same run, the refresh of this resource included, fails with a `401`.",
 		Schema: map[string]*schema.Schema{
 			"username": {
@@ -416,7 +427,9 @@ func resourceCreateAdministrator(ctx context.Context, d *schema.ResourceData, me
 // password of the account is untouched. The id is cleared again when anything
 // after the lookup fails: an account that was adopted halfway would be saved
 // as a tainted resource, and the next apply would destroy an account this
-// resource never created.
+// resource never created. An adopted account is also remembered until it is
+// read again, so that the destroy of the instance a create_before_destroy
+// replacement leaves behind cannot delete it, see administratorsAdopted.
 func adoptAdministrator(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	username := administratorUsername(d.Get("username").(string))
 
@@ -434,7 +447,13 @@ func adoptAdministrator(ctx context.Context, d *schema.ResourceData, meta interf
 	diagnostics := resourceUpdateAdministrator(ctx, d, meta)
 	if diagnostics.HasError() {
 		d.SetId("")
+
+		return diagnostics
 	}
+
+	// after the update: its read takes the id off the list, and nothing reads
+	// the account again before the end of this operation
+	administratorsAdopted.Store(id, struct{}{})
 
 	return diagnostics
 }
@@ -478,6 +497,8 @@ func generateAdministratorPassword() (string, error) {
 // Uses for importing
 func resourceReadAdministrator(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	apiClient := meta.(pritunl.Client)
+
+	administratorsAdopted.Delete(d.Id())
 
 	administrator, err := apiClient.GetAdministrator(d.Id())
 	if err != nil {
@@ -602,6 +623,26 @@ func checkAdministratorLocalOtpAuth(d *schema.ResourceData, administrator pritun
 
 func resourceDeleteAdministrator(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	apiClient := meta.(pritunl.Client)
+
+	// the account was adopted by an instance of this resource earlier in this
+	// operation and has not been read since: this is the old instance of a
+	// replacement with create_before_destroy, whose username the new instance
+	// adopted. The account is the one the new state is bound to, so the old
+	// instance is dropped without deleting it, and the next plan finds nothing
+	// left to destroy
+	if _, adopted := administratorsAdopted.LoadAndDelete(d.Id()); adopted {
+		d.SetId("")
+
+		return diag.Diagnostics{{
+			Severity: diag.Warning,
+			Summary:  "The administrator was kept: the replacement adopted it",
+			Detail: "An administrator that is replaced with create_before_destroy is created again before the old one is destroyed, " +
+				"and creating it adopts the account that already holds the username, which is the account being destroyed. " +
+				"The account was left in place and the old instance was dropped from the state. Replacing an administrator " +
+				"to rotate its credentials needs the default order, destroy first and create after, so leave " +
+				"create_before_destroy out of the lifecycle of this resource.",
+		}}
+	}
 
 	if err := apiClient.DeleteAdministrator(d.Id()); err != nil {
 		// an account that is already gone has nothing left to delete, and

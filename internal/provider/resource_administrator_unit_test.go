@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/hashicorp/go-cty/cty"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
 	"github.com/lfventura/terraform-provider-pritunl/internal/pritunl"
 )
@@ -211,6 +212,13 @@ type administratorCreateClient struct {
 	accounts []pritunl.Administrator
 	created  []pritunl.Administrator
 	updated  []pritunl.Administrator
+	deleted  []string
+
+	// failures to inject: the nth call of GetAdministrator (1-based, 0 for
+	// none) and every call of UpdateAdministrator
+	failGetAt int
+	getCalls  int
+	updateErr error
 }
 
 func (c *administratorCreateClient) find(id string) pritunl.Administrator {
@@ -228,6 +236,12 @@ func (c *administratorCreateClient) GetAdministrators() ([]pritunl.Administrator
 }
 
 func (c *administratorCreateClient) GetAdministrator(id string) (pritunl.Administrator, error) {
+	c.getCalls++
+
+	if c.failGetAt != 0 && c.getCalls == c.failGetAt {
+		return nil, errors.New("GetAdministrator: Error on HTTP request: connection refused")
+	}
+
 	if account := c.find(id); account != nil {
 		// a copy, the way a response is not the stored object
 		read := pritunl.Administrator{}
@@ -270,7 +284,17 @@ func (c *administratorCreateClient) CreateAdministrator(administrator pritunl.Ad
 	return account, nil
 }
 
+func (c *administratorCreateClient) DeleteAdministrator(id string) error {
+	c.deleted = append(c.deleted, id)
+
+	return nil
+}
+
 func (c *administratorCreateClient) UpdateAdministrator(id string, administrator pritunl.Administrator) error {
+	if c.updateErr != nil {
+		return c.updateErr
+	}
+
 	sent := pritunl.Administrator{}
 	for key, value := range administrator {
 		sent[key] = value
@@ -516,4 +540,139 @@ func TestCreateAdministratorAdoptsWithoutAPasswordWhenNoneIsConfigured(t *testin
 	if password := state.Attributes["password"]; password != "" {
 		t.Fatalf("expected the password to stay out of the state, got %d characters", len(password))
 	}
+}
+
+// An account that was adopted halfway must not be left behind in the state: a
+// resource saved with its id is tainted, and the next apply destroys it, an
+// account this resource never created. Each step after the lookup is made to
+// fail in turn, and the create has to report it and keep no id.
+func TestCreateAdministratorAdoptionFailureKeepsNoId(t *testing.T) {
+	forgetAdoptedAdministrators()
+
+	cases := []struct {
+		name   string
+		client func() *administratorCreateClient
+	}{
+		{
+			name: "the read before the update fails",
+			client: func() *administratorCreateClient {
+				return &administratorCreateClient{failGetAt: 1}
+			},
+		},
+		{
+			name: "the update is refused",
+			client: func() *administratorCreateClient {
+				return &administratorCreateClient{updateErr: administratorApiError("updating the administrator", 400, "something_else",
+					"Something else went wrong.",
+					`{"error": "something_else", "error_msg": "Something else went wrong."}`)}
+			},
+		},
+		{
+			name: "the refresh after the update fails",
+			client: func() *administratorCreateClient {
+				return &administratorCreateClient{failGetAt: 2}
+			},
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			client := testCase.client()
+			client.accounts = []pritunl.Administrator{{
+				"id":         "5f1b2a3c4d5e6f7a8b9c0d1e",
+				"username":   "operator",
+				"super_user": true,
+			}}
+
+			state, err := createAdministrator(t, client, map[string]cty.Value{
+				"username": cty.StringVal("operator"),
+			})
+			if err == nil {
+				t.Fatalf("expected the create to fail")
+			}
+
+			if state != nil && state.ID != "" {
+				t.Fatalf("expected no id in the state of a failed adoption, got %q", state.ID)
+			}
+
+			if _, adopted := administratorsAdopted.Load("5f1b2a3c4d5e6f7a8b9c0d1e"); adopted {
+				t.Fatalf("expected a failed adoption not to be remembered")
+			}
+		})
+	}
+}
+
+// The replacement of an administrator with create_before_destroy creates the
+// new instance, which adopts the account of the old one, before the old one is
+// destroyed. The destroy has to leave that account alone, and has to do so
+// only once: after a read the account is deleted as any other.
+func TestDeleteAdministratorLeavesAnAdoptedAccountAlone(t *testing.T) {
+	const id = "5f1b2a3c4d5e6f7a8b9c0d1e"
+
+	forgetAdoptedAdministrators()
+
+	client := &administratorCreateClient{
+		accounts: []pritunl.Administrator{{"id": id, "username": "operator"}},
+	}
+
+	state, err := createAdministrator(t, client, map[string]cty.Value{
+		"username": cty.StringVal("operator"),
+	})
+	if err != nil {
+		t.Fatalf("expected the create to adopt the account, got %s", err)
+	}
+
+	if state.ID != id {
+		t.Fatalf("expected the id of the existing account, got %q", state.ID)
+	}
+
+	resource := resourceAdministrator()
+	old := &terraform.InstanceState{ID: id, Attributes: map[string]string{"id": id, "username": "operator"}}
+
+	// the destroy of the old instance, in the same operation as the adoption
+	kept, diagnostics := resource.Apply(context.Background(), old, &terraform.InstanceDiff{Destroy: true}, client)
+	if diagnostics.HasError() {
+		t.Fatalf("expected the destroy to succeed, got %s", diagnostics[0].Summary)
+	}
+
+	if len(client.deleted) != 0 {
+		t.Fatalf("expected the adopted account to be left in place, deleted %v", client.deleted)
+	}
+
+	if kept != nil && kept.ID != "" {
+		t.Fatalf("expected the old instance to be dropped from the state, got %q", kept.ID)
+	}
+
+	if len(diagnostics) != 1 || diagnostics[0].Severity != diag.Warning {
+		t.Fatalf("expected one warning explaining it, got %v", diagnostics)
+	}
+
+	// a later operation of the same process: the account is read, then deleted
+	if _, adopted := administratorsAdopted.Load(id); adopted {
+		t.Fatalf("expected the account not to be remembered after the destroy")
+	}
+
+	administratorsAdopted.Store(id, struct{}{})
+
+	if diagnostics := resourceReadAdministrator(context.Background(), resource.Data(old), client); diagnostics.HasError() {
+		t.Fatalf("expected the read to succeed, got %s", diagnostics[0].Summary)
+	}
+
+	if _, diagnostics := resource.Apply(context.Background(), old, &terraform.InstanceDiff{Destroy: true}, client); diagnostics.HasError() {
+		t.Fatalf("expected the destroy to succeed, got %s", diagnostics[0].Summary)
+	}
+
+	if len(client.deleted) != 1 || client.deleted[0] != id {
+		t.Fatalf("expected the account to be deleted once it was read, deleted %v", client.deleted)
+	}
+}
+
+// the accounts adopted are remembered by the process, so a test that adopts
+// leaves one behind for the next
+func forgetAdoptedAdministrators() {
+	administratorsAdopted.Range(func(key, _ interface{}) bool {
+		administratorsAdopted.Delete(key)
+
+		return true
+	})
 }
