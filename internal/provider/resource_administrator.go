@@ -49,7 +49,11 @@ const (
 // create_before_destroy creates the new instance, which adopts the very
 // account the old one holds, before it destroys the old one: the destroy would
 // delete the account the new state is bound to. An account listed here is the
-// one a delete has to leave alone, see resourceDeleteAdministrator. A read
+// one a delete has to leave alone, see resourceDeleteAdministrator. It holds
+// within one operation only: the provider is not told which instances are the
+// replaced ones and nothing in the state of an old instance links it to the
+// new one, so an operation interrupted between the create and the destroy
+// leaves nothing for a later one to go by. A read
 // takes the account off the list, which is what keeps a later operation of the
 // same process, a test run or a long lived one, deleting it normally.
 var administratorsAdopted sync.Map
@@ -71,7 +75,7 @@ func resourceAdministrator() *schema.Resource {
 		Description: "The administrator resource allows managing the administrator accounts of a Pritunl instance, the logins of its web console and of its API. They have nothing to do with `pritunl_user`, which manages the VPN profiles of the end users inside an organization: an administrator is not a member of an organization and cannot connect to a VPN server, it operates Pritunl itself.\n\n" +
 			"**Every request behind this resource requires the credentials configured on the `pritunl` provider to belong to a super user.** `GET`, `POST`, `PUT` and `DELETE` on `/admin` are all refused with a `400 requires_super_user` otherwise, so the resource is unusable with an administrator that only holds API access.\n\n" +
 			"Every write is a read-modify-write of the complete administrator object, the same way the Pritunl web console itself works: `PUT /admin/<id>` is a full replace and not a partial update, and a request that leaves a field out has that field reset rather than kept. A rename alone is enough to strip the super user flag off an account, turn its API access off and rotate the API credentials that come with it, so the account is read back from the instance immediately before each write and handed over again with the managed attributes overlaid on top of it.\n\n" +
-			"An account that already exists under the configured username is adopted rather than refused: creating the resource converges it to the configuration the same way an import followed by an update does, and the password of an adopted account is only written when one is configured. Replacing an administrator, to rotate its credentials for instance, needs the default order, destroy first and create after: with `create_before_destroy` the replacement would adopt the very account being replaced, so the provider leaves that account in place when the old instance is destroyed and drops the instance from the state with a warning.\n\n" +
+			"An account that already exists under the configured username is adopted rather than refused: creating the resource converges it to the configuration the same way an import followed by an update does, and the password of an adopted account is only written when one is configured. Replacing an administrator, to rotate its credentials for instance, needs the default order, destroy first and create after: with `create_before_destroy` the replacement would adopt the very account being replaced, so the provider leaves that account in place when the old instance is destroyed and drops the instance from the state with a warning. The provider can only do so within the apply that adopted the account: it is not told which instances are the replaced ones, and the state of an old instance holds nothing that links it to the new one, so an apply that is interrupted between the create and the destroy leaves the old instance to be destroyed by the next apply, which deletes the account the replacement is bound to and has the plan after it create the account again.\n\n" +
 			"Take care when the account managed here is the very one the `pritunl` provider authenticates as: setting `auth_api = false` or `disabled = true` on it revokes the credentials Terraform is holding, and every later request of the same run, the refresh of this resource included, fails with a `401`.",
 		Schema: map[string]*schema.Schema{
 			"username": {
