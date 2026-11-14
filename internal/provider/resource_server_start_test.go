@@ -184,6 +184,9 @@ type startCuttingProxy struct {
 
 	mu  sync.Mutex
 	cut map[string]bool
+	// forwards tracks the starts still running upstream, which the test
+	// waits for before it ends
+	forwards sync.WaitGroup
 }
 
 func newStartCuttingProxy(t *testing.T, target string, delay time.Duration) *startCuttingProxy {
@@ -213,7 +216,9 @@ func newStartCuttingProxy(t *testing.T, target string, delay time.Duration) *sta
 					return
 				}
 				forward.Header = r.Header.Clone()
+				p.forwards.Add(1)
 				go func() {
+					defer p.forwards.Done()
 					resp, err := transport.RoundTrip(forward)
 					if err == nil {
 						io.Copy(io.Discard, resp.Body)
@@ -229,7 +234,11 @@ func newStartCuttingProxy(t *testing.T, target string, delay time.Duration) *sta
 		}
 		reverse.ServeHTTP(w, r)
 	}))
+	// cleanups run last in first out: the forwarded starts end before the
+	// proxy closes and before the test reports, so their log lines never
+	// outlive it
 	t.Cleanup(p.Close)
+	t.Cleanup(p.forwards.Wait)
 
 	return p
 }
