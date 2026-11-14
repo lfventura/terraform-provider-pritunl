@@ -556,3 +556,42 @@ func TestStartServerOnlineDhWindowClosesOnAFailedRead(t *testing.T) {
 		t.Fatalf("nothing may be started, got %d starts", instance.startCalls)
 	}
 }
+
+// A start whose answer arrived with its body cut short keeps the status of
+// the answer: a refusal stays a refusal and is not taken for a start that got
+// no answer, and a 200 stays a 200.
+func TestStartServerTruncatedBodyKeepsTheStatus(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusOK} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", "100")
+			w.WriteHeader(status)
+			w.Write([]byte("cut"))
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Errorf("the test server cannot hijack the connection")
+				return
+			}
+			conn, _, err := hijacker.Hijack()
+			if err == nil {
+				conn.Close()
+			}
+		}))
+
+		err := NewClient(server.URL, "token", "secret", false).StartServer("srv")
+		server.Close()
+
+		if status == http.StatusOK {
+			if err != nil {
+				t.Fatalf("a 200 with a body cut short is still a 200, got %v", err)
+			}
+			continue
+		}
+		var apiError *ApiError
+		if !errors.As(err, &apiError) || apiError.StatusCode != status {
+			t.Fatalf("an ApiError with the %d expected, got %v", status, err)
+		}
+		if isTransientReconciliation(err) || isAnsweredStartFailure(err) {
+			t.Fatalf("a refusal cut short must stay a refusal, got %v", err)
+		}
+	}
+}

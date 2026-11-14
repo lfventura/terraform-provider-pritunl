@@ -729,10 +729,9 @@ func (c client) StartServerContext(ctx context.Context, serverId string) error {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("StartServer: Error on reading the response: %w", err)
-	}
+	// the status line is the answer: a body cut short changes neither a 200
+	// nor a refusal into a start that got no answer
+	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
 		return newApiError("starting the server", resp.StatusCode, body)
 	}
