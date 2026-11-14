@@ -88,7 +88,7 @@ func providerConfigure(ctx context.Context, d *schema.ResourceData) (interface{}
 	return &providerMeta{Client: apiClient, serverStartTimeout: serverStartTimeout}, nil
 }
 
-const serverStartTimeoutDescription = "How long the start of a `pritunl_server` whose `status` is `online` may take, from the first start request until Pritunl reports the server running, as a Go duration greater than zero such as `90s` or `10m`. Within it the provider starts the server again when the start fails transiently or the server stops; when it closes with the server not running, the apply fails. Defaults to `5m`; also taken from the `PRITUNL_SERVER_START_TIMEOUT` environment variable."
+const serverStartTimeoutDescription = "How long the start of a `pritunl_server` whose `status` is `online` may take, from the first start request until Pritunl reports the server running, as a Go duration greater than zero such as `90s` or `10m`. Within it the provider starts the server again when the start fails transiently or the server stops; every request of the start ends when the window closes, and when it closes with the server not running, the apply fails. Defaults to `5m`; also taken from the `PRITUNL_SERVER_START_TIMEOUT` environment variable."
 
 // providerMeta is what the provider hands to the resources: the API client,
 // which it embeds so that every resource reads it as a pritunl.Client, and

@@ -58,16 +58,32 @@ var (
 // transient (an error document of the API, a 4xx, a certificate that does not
 // verify, the context ending) is returned at once.
 //
-// window bounds the whole call, give or take the one request in flight when it
-// closes (a read the transport retries through a restart of the web server can
-// take up to transportRetryWindow).
+// window bounds the whole call: every request is bound to it, so a request
+// that hangs or a read the transport retries through a restart of the web
+// server ends when it closes, and nothing is sent once it has closed. ctx
+// ending (Terraform interrupted, or the timeout of the resource) ends the call
+// as well.
 func StartServerOnline(ctx context.Context, c Client, serverId string, window time.Duration) error {
 	if window <= 0 {
 		window = DefaultServerStartTimeout
 	}
 	deadline := time.Now().Add(window)
+	windowCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 
 	progress := serverStartProgress{id: serverId, window: window}
+
+	// stopped tells why a request failed when the call itself has to end: ctx
+	// ended, or the window closed under the request
+	stopped := func() error {
+		if ctx.Err() != nil {
+			return progress.fail(fmt.Sprintf("interrupted: %s", ctx.Err()), ctx.Err())
+		}
+		if !time.Now().Before(deadline) {
+			return progress.fail("", nil)
+		}
+		return nil
+	}
 
 	// unsure is set while a start whose outcome is unknown may still be running
 	// in Pritunl; confirmed is set when a start was answered 200 while none was
@@ -80,10 +96,12 @@ func StartServerOnline(ctx context.Context, c Client, serverId string, window ti
 			needStart = false
 			progress.starts++
 
-			err := c.StartServer(serverId)
+			err := c.StartServerContext(windowCtx, serverId)
 			switch {
 			case err == nil:
 				confirmed = !unsure
+			case stopped() != nil:
+				return stopped()
 			case isTransientReconciliation(err):
 				unsure = true
 				confirmed = false
@@ -93,7 +111,7 @@ func StartServerOnline(ctx context.Context, c Client, serverId string, window ti
 			}
 		}
 
-		server, err := c.GetServer(serverId)
+		server, err := c.GetServerContext(windowCtx, serverId)
 		switch {
 		case err == nil:
 			progress.observe(server)
@@ -114,6 +132,8 @@ func StartServerOnline(ctx context.Context, c Client, serverId string, window ti
 				// server is started once it reads offline
 				confirmed = false
 			}
+		case stopped() != nil:
+			return stopped()
 		case isTransientReconciliation(err):
 			progress.lastErr = err
 		default:
@@ -129,8 +149,14 @@ func StartServerOnline(ctx context.Context, c Client, serverId string, window ti
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return progress.fail(fmt.Sprintf("interrupted: %s", ctx.Err()), ctx.Err())
+			return stopped()
 		case <-timer.C:
+		}
+
+		// the pause may end exactly when the window closes: nothing more is
+		// sent then
+		if !time.Now().Before(deadline) {
+			return progress.fail("", nil)
 		}
 	}
 }

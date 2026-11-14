@@ -26,6 +26,7 @@ type Client interface {
 
 	GetServers() ([]Server, error)
 	GetServer(id string) (*Server, error)
+	GetServerContext(ctx context.Context, id string) (*Server, error)
 	CreateServer(serverData map[string]interface{}) (*Server, error)
 	UpdateServer(id string, server *Server) error
 	DeleteServer(id string) error
@@ -48,6 +49,7 @@ type Client interface {
 	DetachHostFromServer(hostId, serverId string) error
 
 	StartServer(serverId string) error
+	StartServerContext(ctx context.Context, serverId string) error
 	StopServer(serverId string) error
 
 	PingWebServer(ctx context.Context) error
@@ -268,8 +270,17 @@ func (c client) DeleteOrganization(id string) error {
 }
 
 func (c client) GetServer(id string) (*Server, error) {
+	return c.GetServerContext(context.Background(), id)
+}
+
+// GetServerContext reads a server; the request, its retries included, ends
+// with ctx.
+func (c client) GetServerContext(ctx context.Context, id string) (*Server, error) {
 	url := fmt.Sprintf("/server/%s", id)
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("GetServer: %w", err)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -694,15 +705,20 @@ func (c client) DetachOrganizationFromServer(organizationId, serverId string) er
 	return nil
 }
 
-// StartServer sends one start of the server and returns its outcome without
-// retrying it: the transport does not replay the request, and an answer other
-// than 200 comes back as an *ApiError the caller can classify. Pritunl answers
-// 200 also when it did not start anything (a start already running, DH
-// parameters still being generated), so a 200 alone is no proof the server
-// runs; StartServerOnline is what confirms it.
+// StartServer sends one start of the server; see StartServerContext.
 func (c client) StartServer(serverId string) error {
+	return c.StartServerContext(context.Background(), serverId)
+}
+
+// StartServerContext sends one start of the server, bound to ctx, and returns
+// its outcome without retrying it: the transport does not replay the request,
+// and an answer other than 200 comes back as an *ApiError the caller can
+// classify. Pritunl answers 200 also when it did not start anything (a start
+// already running, DH parameters still being generated), so a 200 alone is no
+// proof the server runs; StartServerOnline is what confirms it.
+func (c client) StartServerContext(ctx context.Context, serverId string) error {
 	url := fmt.Sprintf("/server/%s/operation/start", serverId)
-	req, err := http.NewRequestWithContext(withSingleAttempt(context.Background()), "PUT", url, nil)
+	req, err := http.NewRequestWithContext(withSingleAttempt(ctx), "PUT", url, nil)
 	if err != nil {
 		return fmt.Errorf("StartServer: %w", err)
 	}

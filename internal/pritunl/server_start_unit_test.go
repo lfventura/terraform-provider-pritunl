@@ -26,7 +26,7 @@ type startingInstance struct {
 	readCalls  int
 }
 
-func (f *startingInstance) StartServer(string) error {
+func (f *startingInstance) StartServerContext(context.Context, string) error {
 	f.startCalls++
 	if len(f.starts) == 0 {
 		return nil
@@ -36,7 +36,7 @@ func (f *startingInstance) StartServer(string) error {
 	return err
 }
 
-func (f *startingInstance) GetServer(id string) (*Server, error) {
+func (f *startingInstance) GetServerContext(_ context.Context, id string) (*Server, error) {
 	f.readCalls++
 	server := f.reads[0]
 	if len(f.reads) > 1 {
@@ -312,3 +312,41 @@ type syscallError struct{ errno syscall.Errno }
 
 func (e *syscallError) Error() string { return "read: " + e.errno.Error() }
 func (e *syscallError) Unwrap() error { return e.errno }
+
+// A start request that never gets an answer ends when the window closes,
+// instead of holding the apply.
+func TestStartServerOnlineHangingRequestEndsWithTheWindow(t *testing.T) {
+	shortenServerStart(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	started := time.Now()
+	err := StartServerOnline(context.Background(), NewClient(server.URL, "token", "secret", false), "srv", 100*time.Millisecond)
+
+	var startErr *ServerStartError
+	if !errors.As(err, &startErr) || !strings.Contains(err.Error(), "is not online after 100ms") {
+		t.Fatalf("the window must end the call with a ServerStartError, got %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("the call outlived its window: %s", elapsed)
+	}
+}
+
+// Once the window has closed nothing more is sent, even when the pause ended
+// exactly on it.
+func TestStartServerOnlineSendsNothingAfterTheWindow(t *testing.T) {
+	shortenServerStart(t)
+	serverStartPollInterval = time.Second
+	instance := &startingInstance{starts: []error{startTimedOut}, reads: []Server{offline}}
+
+	err := StartServerOnline(context.Background(), instance, "srv", 30*time.Millisecond)
+	if err == nil {
+		t.Fatal("the call must fail")
+	}
+	if instance.startCalls != 1 || instance.readCalls != 1 {
+		t.Fatalf("nothing may be sent after the window, got %d starts and %d reads", instance.startCalls, instance.readCalls)
+	}
+}
