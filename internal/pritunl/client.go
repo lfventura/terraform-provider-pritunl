@@ -694,19 +694,31 @@ func (c client) DetachOrganizationFromServer(organizationId, serverId string) er
 	return nil
 }
 
+// StartServer sends one start of the server and returns its outcome without
+// retrying it: the transport does not replay the request, and an answer other
+// than 200 comes back as an *ApiError the caller can classify. Pritunl answers
+// 200 also when it did not start anything (a start already running, DH
+// parameters still being generated), so a 200 alone is no proof the server
+// runs; StartServerOnline is what confirms it.
 func (c client) StartServer(serverId string) error {
 	url := fmt.Sprintf("/server/%s/operation/start", serverId)
-	req, err := http.NewRequest("PUT", url, nil)
+	req, err := http.NewRequestWithContext(withSingleAttempt(context.Background()), "PUT", url, nil)
+	if err != nil {
+		return fmt.Errorf("StartServer: %w", err)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("StartServer: Error on HTTP request: %s", err)
+		return fmt.Errorf("StartServer: Error on HTTP request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("StartServer: Error on reading the response: %w", err)
+	}
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("Non-200 response on starting the server\nbody=%s", body)
+		return newApiError("starting the server", resp.StatusCode, body)
 	}
 
 	return nil

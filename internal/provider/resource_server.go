@@ -487,7 +487,7 @@ func resourceServer() *schema.Resource {
 				Required:     false,
 				Optional:     true,
 				Computed:     true,
-				Description:  "The status of the server",
+				Description:  "The status of the server: `online` or `offline`. With `online`, creating the server, and every update that restarts it, starts the server and waits until Pritunl runs it: the server has to read `online` either right after a start Pritunl answered with success, or for longer than the 40 seconds Pritunl may take to give up a start whose answer was lost (4 seconds plus its default `vpn.op_timeout` of 25 seconds). A start that fails transiently, a server that stops again and a server still generating its DH parameters are started again, within the provider's `server_start_timeout`; when that closes with the server not running, the apply fails with an error that names the server. A server Pritunl reports as `pending` (DH parameters not generated yet) reads `offline`.",
 				RequiredWith: []string{"organization_ids"},
 				ValidateDiagFunc: func(v interface{}, path cty.Path) diag.Diagnostics {
 					allowedStatusesMap := map[string]struct{}{
@@ -808,7 +808,7 @@ func resourceCreateServer(ctx context.Context, d *schema.ResourceData, meta inte
 	}
 
 	if d.Get("status").(string) == pritunl.ServerStatusOnline {
-		err = apiClient.StartServer(d.Id())
+		err = pritunl.StartServerOnline(ctx, apiClient, d.Id(), serverStartTimeout(meta))
 		if err != nil {
 			return diag.Errorf("Error on starting server: %s", err)
 		}
@@ -1125,7 +1125,7 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 	}
 
 	if shouldServerBeStarted {
-		err = apiClient.StartServer(d.Id())
+		err = pritunl.StartServerOnline(ctx, apiClient, d.Id(), serverStartTimeout(meta))
 		if err != nil {
 			return diag.Errorf("Error on starting server: %s", err)
 		}

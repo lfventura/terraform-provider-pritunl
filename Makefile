@@ -34,12 +34,14 @@ test:
 	@chmod +x ./tools/wait-for-api.sh
 	./tools/wait-for-api.sh https://localhost/state 180
 
+	# PRITUNL_ACC_CONTAINER lets the server start test inject a slow start in the container
 	TF_ACC=1 \
 	PRITUNL_URL="https://localhost/" \
 	PRITUNL_INSECURE="true" \
 	PRITUNL_TOKEN=tfacctest_token \
 	PRITUNL_SECRET=tfacctest_secret \
 	PRITUNL_OVPN_DCO="$(PRITUNL_OVPN_DCO)" \
+	PRITUNL_ACC_CONTAINER=tf_pritunl_acc_test \
 	go test -v -cover -count 1 ./internal/provider
 
 	@docker rm tf_pritunl_acc_test -f

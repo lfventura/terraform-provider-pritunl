@@ -2,6 +2,8 @@ package provider
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -36,6 +38,13 @@ func Provider() *schema.Provider {
 				Optional:    true,
 				DefaultFunc: schema.EnvDefaultFunc("PRITUNL_CONNECTION_CHECK", true),
 			},
+			"server_start_timeout": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				Description:  serverStartTimeoutDescription,
+				DefaultFunc:  schema.EnvDefaultFunc("PRITUNL_SERVER_START_TIMEOUT", pritunl.DefaultServerStartTimeout.String()),
+				ValidateFunc: validateServerStartTimeout,
+			},
 		},
 		ResourcesMap: map[string]*schema.Resource{
 			"pritunl_administrator": resourceAdministrator(),
@@ -61,6 +70,11 @@ func providerConfigure(ctx context.Context, d *schema.ResourceData) (interface{}
 	insecure := d.Get("insecure").(bool)
 	connectionCheck := d.Get("connection_check").(bool)
 
+	serverStartTimeout, err := parseServerStartTimeout(d.Get("server_start_timeout").(string))
+	if err != nil {
+		return nil, diag.FromErr(err)
+	}
+
 	apiClient := pritunl.NewClient(url, token, secret, insecure)
 
 	if connectionCheck {
@@ -71,5 +85,47 @@ func providerConfigure(ctx context.Context, d *schema.ResourceData) (interface{}
 		}
 	}
 
-	return apiClient, nil
+	return &providerMeta{Client: apiClient, serverStartTimeout: serverStartTimeout}, nil
+}
+
+const serverStartTimeoutDescription = "How long the start of a `pritunl_server` whose `status` is `online` may take, from the first start request until Pritunl reports the server running, as a Go duration greater than zero such as `90s` or `10m`. Within it the provider starts the server again when the start fails transiently or the server stops; when it closes with the server not running, the apply fails. Defaults to `5m`; also taken from the `PRITUNL_SERVER_START_TIMEOUT` environment variable."
+
+// providerMeta is what the provider hands to the resources: the API client,
+// which it embeds so that every resource reads it as a pritunl.Client, and
+// the provider settings the resources need.
+type providerMeta struct {
+	pritunl.Client
+	serverStartTimeout time.Duration
+}
+
+// serverStartTimeout is the window of a server start: the provider setting,
+// or the default when the meta is a bare client, as in the unit tests.
+func serverStartTimeout(meta interface{}) time.Duration {
+	if m, ok := meta.(*providerMeta); ok && m.serverStartTimeout > 0 {
+		return m.serverStartTimeout
+	}
+
+	return pritunl.DefaultServerStartTimeout
+}
+
+// parseServerStartTimeout reads server_start_timeout: a Go duration greater
+// than zero.
+func parseServerStartTimeout(value string) (time.Duration, error) {
+	timeout, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("server_start_timeout %q is not a duration such as \"90s\" or \"10m\": %w", value, err)
+	}
+	if timeout <= 0 {
+		return 0, fmt.Errorf("server_start_timeout must be greater than zero, got %q", value)
+	}
+
+	return timeout, nil
+}
+
+func validateServerStartTimeout(value interface{}, _ string) ([]string, []error) {
+	if _, err := parseServerStartTimeout(value.(string)); err != nil {
+		return nil, []error{err}
+	}
+
+	return nil, nil
 }
