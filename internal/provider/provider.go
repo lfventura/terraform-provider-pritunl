@@ -43,7 +43,14 @@ func Provider() *schema.Provider {
 				Optional:     true,
 				Description:  serverStartTimeoutDescription,
 				DefaultFunc:  schema.EnvDefaultFunc("PRITUNL_SERVER_START_TIMEOUT", pritunl.DefaultServerStartTimeout.String()),
-				ValidateFunc: validateServerStartTimeout,
+				ValidateFunc: validateDurationSetting("server_start_timeout"),
+			},
+			"server_dh_timeout": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				Description:  serverDhTimeoutDescription,
+				DefaultFunc:  schema.EnvDefaultFunc("PRITUNL_SERVER_DH_TIMEOUT", pritunl.DefaultServerDhTimeout.String()),
+				ValidateFunc: validateDurationSetting("server_dh_timeout"),
 			},
 		},
 		ResourcesMap: map[string]*schema.Resource{
@@ -70,7 +77,11 @@ func providerConfigure(ctx context.Context, d *schema.ResourceData) (interface{}
 	insecure := d.Get("insecure").(bool)
 	connectionCheck := d.Get("connection_check").(bool)
 
-	serverStartTimeout, err := parseServerStartTimeout(d.Get("server_start_timeout").(string))
+	serverStartTimeout, err := parseDurationSetting("server_start_timeout", d.Get("server_start_timeout").(string))
+	if err != nil {
+		return nil, diag.FromErr(err)
+	}
+	serverDhTimeout, err := parseDurationSetting("server_dh_timeout", d.Get("server_dh_timeout").(string))
 	if err != nil {
 		return nil, diag.FromErr(err)
 	}
@@ -85,10 +96,12 @@ func providerConfigure(ctx context.Context, d *schema.ResourceData) (interface{}
 		}
 	}
 
-	return &providerMeta{Client: apiClient, serverStartTimeout: serverStartTimeout}, nil
+	return &providerMeta{Client: apiClient, serverStartTimeout: serverStartTimeout, serverDhTimeout: serverDhTimeout}, nil
 }
 
-const serverStartTimeoutDescription = "How long the start of a `pritunl_server` whose `status` is `online` may take, from the first start request until Pritunl reports the server running, as a Go duration greater than zero such as `90s` or `10m`. Within it the provider starts the server again when the start fails transiently or the server stops; every request of the start ends when the window closes, and when it closes with the server not running, the apply fails. Defaults to `5m`; also taken from the `PRITUNL_SERVER_START_TIMEOUT` environment variable."
+const serverStartTimeoutDescription = "How long the start of a `pritunl_server` whose `status` is `online` may take, from the moment the server has its DH parameters until Pritunl reports it running, as a Go duration greater than zero such as `90s` or `10m`. Within it the provider starts the server again when a start fails or the server stops; every request of the start ends when the window closes, and when it closes with the server not running, the apply fails. Defaults to `5m`; also taken from the `PRITUNL_SERVER_START_TIMEOUT` environment variable."
+
+const serverDhTimeoutDescription = "How long the provider waits for a `pritunl_server` whose `status` is `online` to get its DH parameters before it starts the server, as a Go duration greater than zero such as `90s` or `15m`. Pritunl keeps 3 pre-generated DH parameter sets; a server created when none is left reads `pending` until a set is generated for it, which takes from seconds to several minutes depending on the CPU. The provider sends no start while the server reads `pending`. When the window closes with the server still pending, the apply fails with an error that names the server; a server being created is then tainted, and the next apply replaces it. Defaults to `10m`; also taken from the `PRITUNL_SERVER_DH_TIMEOUT` environment variable."
 
 // providerMeta is what the provider hands to the resources: the API client,
 // which it embeds so that every resource reads it as a pritunl.Client, and
@@ -96,6 +109,7 @@ const serverStartTimeoutDescription = "How long the start of a `pritunl_server` 
 type providerMeta struct {
 	pritunl.Client
 	serverStartTimeout time.Duration
+	serverDhTimeout    time.Duration
 }
 
 // serverStartTimeout is the window of a server start: the provider setting,
@@ -108,24 +122,36 @@ func serverStartTimeout(meta interface{}) time.Duration {
 	return pritunl.DefaultServerStartTimeout
 }
 
-// parseServerStartTimeout reads server_start_timeout: a Go duration greater
+// serverDhTimeout is how long a pending server is waited for: the provider
+// setting, or the default when the meta is a bare client.
+func serverDhTimeout(meta interface{}) time.Duration {
+	if m, ok := meta.(*providerMeta); ok && m.serverDhTimeout > 0 {
+		return m.serverDhTimeout
+	}
+
+	return pritunl.DefaultServerDhTimeout
+}
+
+// parseDurationSetting reads a provider setting that is a Go duration greater
 // than zero.
-func parseServerStartTimeout(value string) (time.Duration, error) {
+func parseDurationSetting(name, value string) (time.Duration, error) {
 	timeout, err := time.ParseDuration(value)
 	if err != nil {
-		return 0, fmt.Errorf("server_start_timeout %q is not a duration such as \"90s\" or \"10m\": %w", value, err)
+		return 0, fmt.Errorf("%s %q is not a duration such as \"90s\" or \"10m\": %w", name, value, err)
 	}
 	if timeout <= 0 {
-		return 0, fmt.Errorf("server_start_timeout must be greater than zero, got %q", value)
+		return 0, fmt.Errorf("%s must be greater than zero, got %q", name, value)
 	}
 
 	return timeout, nil
 }
 
-func validateServerStartTimeout(value interface{}, _ string) ([]string, []error) {
-	if _, err := parseServerStartTimeout(value.(string)); err != nil {
-		return nil, []error{err}
-	}
+func validateDurationSetting(name string) schema.SchemaValidateFunc {
+	return func(value interface{}, _ string) ([]string, []error) {
+		if _, err := parseDurationSetting(name, value.(string)); err != nil {
+			return nil, []error{err}
+		}
 
-	return nil, nil
+		return nil, nil
+	}
 }

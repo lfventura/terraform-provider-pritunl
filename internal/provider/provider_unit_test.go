@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -10,14 +11,14 @@ import (
 func TestParseServerStartTimeout(t *testing.T) {
 	valid := map[string]time.Duration{"90s": 90 * time.Second, "10m": 10 * time.Minute, "5m0s": 5 * time.Minute}
 	for value, want := range valid {
-		got, err := parseServerStartTimeout(value)
+		got, err := parseDurationSetting("server_start_timeout", value)
 		if err != nil || got != want {
 			t.Errorf("%q: got %s, %v, want %s", value, got, err, want)
 		}
 	}
 
 	for _, value := range []string{"", "5", "ten minutes", "0s", "-1m"} {
-		if _, err := parseServerStartTimeout(value); err == nil {
+		if _, err := parseDurationSetting("server_start_timeout", value); err == nil {
 			t.Errorf("%q must be refused", value)
 		}
 	}
@@ -32,7 +33,7 @@ func TestProviderDefaultServerStartTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, err := parseServerStartTimeout(value.(string)); err != nil || got != pritunl.DefaultServerStartTimeout {
+	if got, err := parseDurationSetting("server_start_timeout", value.(string)); err != nil || got != pritunl.DefaultServerStartTimeout {
 		t.Fatalf("the default must be %s, got %v (%v)", pritunl.DefaultServerStartTimeout, value, err)
 	}
 }
@@ -50,5 +51,35 @@ func TestProviderMetaCarriesServerStartTimeout(t *testing.T) {
 	}
 	if got := serverStartTimeout(pritunl.NewClient("https://localhost", "t", "s", true)); got != pritunl.DefaultServerStartTimeout {
 		t.Fatalf("a bare client must get the default window, got %s", got)
+	}
+}
+
+func TestProviderDefaultServerDhTimeout(t *testing.T) {
+	t.Setenv("PRITUNL_SERVER_DH_TIMEOUT", "")
+
+	value, err := Provider().Schema["server_dh_timeout"].DefaultFunc()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := parseDurationSetting("server_dh_timeout", value.(string)); err != nil || got != pritunl.DefaultServerDhTimeout {
+		t.Fatalf("the default must be %s, got %v (%v)", pritunl.DefaultServerDhTimeout, value, err)
+	}
+}
+
+func TestProviderMetaCarriesServerDhTimeout(t *testing.T) {
+	meta := &providerMeta{Client: pritunl.NewClient("https://localhost", "t", "s", true), serverDhTimeout: 12 * time.Minute}
+
+	if got := serverDhTimeout(meta); got != 12*time.Minute {
+		t.Fatalf("the configured window must be used, got %s", got)
+	}
+	if got := serverDhTimeout(pritunl.NewClient("https://localhost", "t", "s", true)); got != pritunl.DefaultServerDhTimeout {
+		t.Fatalf("a bare client must get the default window, got %s", got)
+	}
+}
+
+func TestParseDurationSettingNamesTheSetting(t *testing.T) {
+	_, err := parseDurationSetting("server_dh_timeout", "0s")
+	if err == nil || !strings.Contains(err.Error(), "server_dh_timeout") {
+		t.Fatalf("the error must name the setting, got %v", err)
 	}
 }

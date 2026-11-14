@@ -68,13 +68,13 @@ var (
 
 func TestStartServerOnlineStartAnsweredThenOnline(t *testing.T) {
 	shortenServerStart(t)
-	instance := &startingInstance{reads: []Server{online(1)}}
+	instance := &startingInstance{reads: []Server{offline, online(1)}}
 
-	if err := StartServerOnline(context.Background(), instance, "srv", time.Second); err != nil {
+	if err := StartServerOnline(context.Background(), instance, "srv", time.Second, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if instance.startCalls != 1 || instance.readCalls != 1 {
-		t.Fatalf("one start and one read expected, got %d starts and %d reads", instance.startCalls, instance.readCalls)
+	if instance.startCalls != 1 || instance.readCalls != 2 {
+		t.Fatalf("one start and two reads expected, got %d starts and %d reads", instance.startCalls, instance.readCalls)
 	}
 }
 
@@ -82,9 +82,9 @@ func TestStartServerOnlineStartAnsweredThenOnline(t *testing.T) {
 // lost, stopping server"): it is started again.
 func TestStartServerOnlineStartedThenStoppedIsStartedAgain(t *testing.T) {
 	shortenServerStart(t)
-	instance := &startingInstance{reads: []Server{offline, online(1)}}
+	instance := &startingInstance{reads: []Server{offline, offline, online(1)}}
 
-	if err := StartServerOnline(context.Background(), instance, "srv", time.Second); err != nil {
+	if err := StartServerOnline(context.Background(), instance, "srv", time.Second, time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	if instance.startCalls != 2 {
@@ -100,14 +100,14 @@ func TestStartServerOnlineTransientFailuresThenStarted(t *testing.T) {
 	dropped := &syscallError{syscall.ECONNRESET}
 	instance := &startingInstance{
 		starts: []error{webRestarting, dropped, startTimedOut, nil},
-		reads:  []Server{offline, offline, offline, online(1), online(20), online(40)},
+		reads:  []Server{offline, offline, offline, offline, online(1), online(20), online(40)},
 	}
 
-	if err := StartServerOnline(context.Background(), instance, "srv", time.Second); err != nil {
+	if err := StartServerOnline(context.Background(), instance, "srv", time.Second, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if instance.startCalls != 4 || instance.readCalls != 6 {
-		t.Fatalf("4 starts and 6 reads expected, got %d and %d", instance.startCalls, instance.readCalls)
+	if instance.startCalls != 4 || instance.readCalls != 7 {
+		t.Fatalf("4 starts and 7 reads expected, got %d and %d", instance.startCalls, instance.readCalls)
 	}
 }
 
@@ -121,16 +121,16 @@ func TestStartServerOnlineLostAnswerWaitsOutTheRevert(t *testing.T) {
 	shortenServerStart(t)
 	instance := &startingInstance{
 		starts: []error{webRestarting, nil},
-		reads:  []Server{online(3), online(10), online(28), offline, online(1), online(41)},
+		reads:  []Server{offline, online(3), online(10), online(28), offline, online(1), online(41)},
 	}
 
-	if err := StartServerOnline(context.Background(), instance, "srv", time.Second); err != nil {
+	if err := StartServerOnline(context.Background(), instance, "srv", time.Second, time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	if instance.startCalls != 2 {
 		t.Fatalf("the reverted start must be sent again, got %d starts", instance.startCalls)
 	}
-	if instance.readCalls != 6 {
+	if instance.readCalls != 7 {
 		t.Fatalf("online must hold past the settle time, got %d reads", instance.readCalls)
 	}
 }
@@ -143,14 +143,14 @@ func TestStartServerOnlineLostRequestBeginsAfterTheOfflineRead(t *testing.T) {
 	shortenServerStart(t)
 	instance := &startingInstance{
 		starts: []error{webRestarting, nil, nil},
-		reads:  []Server{offline, online(1), online(15), offline, online(1), online(40)},
+		reads:  []Server{offline, offline, online(1), online(15), offline, online(1), online(40)},
 	}
 
-	if err := StartServerOnline(context.Background(), instance, "srv", time.Second); err != nil {
+	if err := StartServerOnline(context.Background(), instance, "srv", time.Second, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if instance.startCalls != 3 || instance.readCalls != 6 {
-		t.Fatalf("3 starts and 6 reads expected, got %d and %d", instance.startCalls, instance.readCalls)
+	if instance.startCalls != 3 || instance.readCalls != 7 {
+		t.Fatalf("3 starts and 7 reads expected, got %d and %d", instance.startCalls, instance.readCalls)
 	}
 }
 
@@ -160,10 +160,10 @@ func TestStartServerOnlineLostAnswerThatWentThrough(t *testing.T) {
 	shortenServerStart(t)
 	instance := &startingInstance{
 		starts: []error{webRestarting},
-		reads:  []Server{online(1), online(20), online(40)},
+		reads:  []Server{offline, online(1), online(20), online(40)},
 	}
 
-	if err := StartServerOnline(context.Background(), instance, "srv", time.Second); err != nil {
+	if err := StartServerOnline(context.Background(), instance, "srv", time.Second, time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	if instance.startCalls != 1 {
@@ -171,17 +171,115 @@ func TestStartServerOnlineLostAnswerThatWentThrough(t *testing.T) {
 	}
 }
 
-// A start answered 200 while the DH parameters are generated did nothing: the
-// server is started once it reads offline.
-func TestStartServerOnlinePendingIsStartedOnceGenerated(t *testing.T) {
+// A pending server is never sent a start: Pritunl answers it 200 without
+// starting anything and, when no generation is queued for the server, takes a
+// pooled DH parameter set into memory and loses it. The server is started once
+// it reads offline.
+func TestStartServerOnlinePendingIsNotStartedUntilOffline(t *testing.T) {
 	shortenServerStart(t)
-	instance := &startingInstance{reads: []Server{pending, pending, offline, online(1)}}
+	instance := &startingInstance{reads: []Server{pending, pending, pending, offline, online(1)}}
 
-	if err := StartServerOnline(context.Background(), instance, "srv", time.Second); err != nil {
+	if err := StartServerOnline(context.Background(), instance, "srv", time.Second, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if instance.startCalls != 1 || instance.readCalls != 5 {
+		t.Fatalf("one start, after the offline read, expected; got %d starts and %d reads", instance.startCalls, instance.readCalls)
+	}
+}
+
+// A server that stays pending past the DH window fails with an error that
+// names it and says the DH parameters were never generated; nothing was sent.
+func TestStartServerOnlineDhWindowCloses(t *testing.T) {
+	shortenServerStart(t)
+	instance := &startingInstance{reads: []Server{pending}}
+
+	err := StartServerOnline(context.Background(), instance, "srv", time.Minute, 30*time.Millisecond)
+
+	var dhErr *ServerDhPendingError
+	if !errors.As(err, &dhErr) {
+		t.Fatalf("a ServerDhPendingError expected, got %v", err)
+	}
+	if dhErr.ServerId != "srv" || dhErr.ServerName != "vpn-a" || dhErr.Window != 30*time.Millisecond {
+		t.Fatalf("the error must name the server and the window, got %+v", dhErr)
+	}
+	for _, want := range []string{`server "vpn-a" (srv)`, "pending after 30ms", "never generated its DH parameters"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error %q does not say %q", err, want)
+		}
+	}
+	if instance.startCalls != 0 {
+		t.Fatalf("a pending server must not be started, got %d starts", instance.startCalls)
+	}
+}
+
+// The start window begins once the server has its DH parameters: a DH wait
+// longer than the start window does not use it up.
+func TestStartServerOnlineStartWindowBeginsAfterTheDhWait(t *testing.T) {
+	shortenServerStart(t)
+	serverStartPollInterval = 5 * time.Millisecond
+	reads := make([]Server, 0, 12)
+	for i := 0; i < 10; i++ {
+		reads = append(reads, pending)
+	}
+	instance := &startingInstance{reads: append(reads, offline, online(1))}
+
+	if err := StartServerOnline(context.Background(), instance, "srv", 40*time.Millisecond, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if instance.startCalls != 1 {
+		t.Fatalf("one start expected, got %d", instance.startCalls)
+	}
+}
+
+// A server that reads pending again after it had its DH parameters is not
+// started until it reads offline.
+func TestStartServerOnlinePendingAgainIsNotStarted(t *testing.T) {
+	shortenServerStart(t)
+	instance := &startingInstance{
+		starts: []error{startTimedOut, nil},
+		reads:  []Server{offline, pending, pending, offline, online(1)},
+	}
+
+	if err := StartServerOnline(context.Background(), instance, "srv", time.Second, time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	if instance.startCalls != 2 {
 		t.Fatalf("2 starts expected, got %d", instance.startCalls)
+	}
+}
+
+// A start Pritunl answered with "Server start timed out" is over: the server
+// is started again, and the 200 that follows confirms it without waiting for
+// the settle time.
+func TestStartServerOnlineAnsweredTimeoutNeedsNoSettle(t *testing.T) {
+	shortenServerStart(t)
+	instance := &startingInstance{
+		starts: []error{startTimedOut, nil},
+		reads:  []Server{offline, offline, online(1)},
+	}
+
+	if err := StartServerOnline(context.Background(), instance, "srv", time.Second, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if instance.startCalls != 2 || instance.readCalls != 3 {
+		t.Fatalf("2 starts and 3 reads expected, got %d and %d", instance.startCalls, instance.readCalls)
+	}
+}
+
+func TestIsAnsweredStartFailure(t *testing.T) {
+	cases := map[error]bool{
+		startTimedOut: true,
+		webRestarting: false,
+		newApiError("starting the server", http.StatusServiceUnavailable, nil):                             false,
+		newApiError("starting the server", http.StatusGatewayTimeout, nil):                                 false,
+		newApiError("starting the server", http.StatusInternalServerError, []byte(`{"error": "unknown"}`)): false,
+		newApiError("starting the server", http.StatusNotFound, []byte("404: Not Found")):                  false,
+		&syscallError{syscall.ECONNRESET}:                                                                  false,
+	}
+	for err, want := range cases {
+		if got := isAnsweredStartFailure(err); got != want {
+			t.Errorf("%v: got %v, want %v", err, got, want)
+		}
 	}
 }
 
@@ -192,7 +290,7 @@ func TestStartServerOnlineNeverOnlineTimesOut(t *testing.T) {
 		reads:  []Server{offline},
 	}
 
-	err := StartServerOnline(context.Background(), instance, "srv", 30*time.Millisecond)
+	err := StartServerOnline(context.Background(), instance, "srv", 30*time.Millisecond, time.Minute)
 	var startErr *ServerStartError
 	if !errors.As(err, &startErr) {
 		t.Fatalf("a ServerStartError expected, got %v", err)
@@ -214,9 +312,9 @@ func TestStartServerOnlineNeverOnlineTimesOut(t *testing.T) {
 // is not reported as started.
 func TestStartServerOnlineUnconfirmedOnlineTimesOut(t *testing.T) {
 	shortenServerStart(t)
-	instance := &startingInstance{starts: []error{webRestarting}, reads: []Server{online(5)}}
+	instance := &startingInstance{starts: []error{webRestarting}, reads: []Server{offline, online(5)}}
 
-	err := StartServerOnline(context.Background(), instance, "srv", 20*time.Millisecond)
+	err := StartServerOnline(context.Background(), instance, "srv", 20*time.Millisecond, time.Minute)
 	if err == nil || !strings.Contains(err.Error(), "online for 5s") {
 		t.Fatalf("an unconfirmed online server must fail the call, got %v", err)
 	}
@@ -233,11 +331,11 @@ func TestStartServerOnlineRefusalFailsAtOnce(t *testing.T) {
 	for _, refusal := range refusals {
 		instance := &startingInstance{starts: []error{refusal}, reads: []Server{offline}}
 
-		err := StartServerOnline(context.Background(), instance, "srv", time.Minute)
+		err := StartServerOnline(context.Background(), instance, "srv", time.Minute, time.Minute)
 		if !errors.Is(err, refusal) {
 			t.Fatalf("the refusal must be returned, got %v", err)
 		}
-		if instance.startCalls != 1 || instance.readCalls != 0 {
+		if instance.startCalls != 1 || instance.readCalls != 1 {
 			t.Fatalf("a refusal ends the call at once, got %d starts and %d reads", instance.startCalls, instance.readCalls)
 		}
 	}
@@ -245,13 +343,13 @@ func TestStartServerOnlineRefusalFailsAtOnce(t *testing.T) {
 
 func TestStartServerOnlineHonorsContext(t *testing.T) {
 	shortenServerStart(t)
-	instance := &startingInstance{starts: []error{webRestarting}, reads: []Server{online(1)}}
+	instance := &startingInstance{starts: []error{webRestarting}, reads: []Server{offline, online(1)}}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 
 	started := time.Now()
-	err := StartServerOnline(ctx, instance, "srv", time.Hour)
+	err := StartServerOnline(ctx, instance, "srv", time.Hour, time.Minute)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("the context deadline must end the call, got %v", err)
 	}
@@ -338,16 +436,41 @@ func TestStartServerOnlineHangingRequestEndsWithTheWindow(t *testing.T) {
 	shortenServerStart(t)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Write([]byte(`{"id": "srv", "name": "vpn-a", "status": "offline"}`))
+			return
+		}
 		<-r.Context().Done()
 	}))
 	defer server.Close()
 
 	started := time.Now()
-	err := StartServerOnline(context.Background(), NewClient(server.URL, "token", "secret", false), "srv", 100*time.Millisecond)
+	err := StartServerOnline(context.Background(), NewClient(server.URL, "token", "secret", false), "srv", 100*time.Millisecond, time.Minute)
 
 	var startErr *ServerStartError
 	if !errors.As(err, &startErr) || !strings.Contains(err.Error(), "is not online after 100ms") {
 		t.Fatalf("the window must end the call with a ServerStartError, got %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("the call outlived its window: %s", elapsed)
+	}
+}
+
+// A read that hangs while the server is waited for ends with the DH window.
+func TestStartServerOnlineHangingReadEndsWithTheDhWindow(t *testing.T) {
+	shortenServerStart(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	started := time.Now()
+	err := StartServerOnline(context.Background(), NewClient(server.URL, "token", "secret", false), "srv", time.Minute, 100*time.Millisecond)
+
+	var startErr *ServerStartError
+	if !errors.As(err, &startErr) || !strings.Contains(err.Error(), "never read back") {
+		t.Fatalf("a server never read must fail with a ServerStartError, got %v", err)
 	}
 	if elapsed := time.Since(started); elapsed > 5*time.Second {
 		t.Fatalf("the call outlived its window: %s", elapsed)
@@ -361,11 +484,11 @@ func TestStartServerOnlineSendsNothingAfterTheWindow(t *testing.T) {
 	serverStartPollInterval = time.Second
 	instance := &startingInstance{starts: []error{startTimedOut}, reads: []Server{offline}}
 
-	err := StartServerOnline(context.Background(), instance, "srv", 30*time.Millisecond)
+	err := StartServerOnline(context.Background(), instance, "srv", 30*time.Millisecond, time.Minute)
 	if err == nil {
 		t.Fatal("the call must fail")
 	}
-	if instance.startCalls != 1 || instance.readCalls != 1 {
+	if instance.startCalls != 1 || instance.readCalls != 2 {
 		t.Fatalf("nothing may be sent after the window, got %d starts and %d reads", instance.startCalls, instance.readCalls)
 	}
 }

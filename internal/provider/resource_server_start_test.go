@@ -99,6 +99,44 @@ func TestAccPritunlServerStartLostAndTimedOut(t *testing.T) {
 	})
 }
 
+// A server created while the DH parameter pool of Pritunl is empty reads
+// "pending" until a set is generated for it. The provider must not send it a
+// start then (Pritunl answers 200 without starting it, and a start of a
+// pending server without a generation of its own loses a pooled set), and
+// must start it once it reads offline. The pool is emptied in the container,
+// named by PRITUNL_ACC_CONTAINER, before the apply; a proxy reads the server
+// before forwarding each start and records what it saw.
+func TestAccPritunlServerPendingIsNotStarted(t *testing.T) {
+	if os.Getenv("TF_ACC") == "" {
+		t.Skip("TF_ACC is not set: acceptance tests are skipped")
+	}
+	container := os.Getenv("PRITUNL_ACC_CONTAINER")
+	if container == "" {
+		t.Skip("PRITUNL_ACC_CONTAINER is not set: the test needs the docker container of the instance")
+	}
+
+	proxy := newStartWatchingProxy(t, os.Getenv("PRITUNL_URL"))
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:          func() { preCheck(t) },
+		ProviderFactories: providerFactories,
+		CheckDestroy:      testPritunlServerDestroy,
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() {
+					dockerExec(t, container, `E='db.dh_params.deleteMany({})'; if command -v mongosh >/dev/null; then mongosh --quiet pritunl --eval "$E"; else mongo --quiet pritunl --eval "$E"; fi`)
+				},
+				Config: testPritunlServerOnlineConfig(proxy.URL, "tfacc-start-pending", 230, 15230),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("pritunl_server.test", "status", pritunl.ServerStatusOnline),
+					testAccCheckServerLiveStatus("pritunl_server.test", pritunl.ServerStatusOnline),
+					proxy.check,
+				),
+			},
+		},
+	})
+}
+
 // testAccCheckServerLiveStatus reads the server through the API.
 func testAccCheckServerLiveStatus(resourceName, want string) resource.TestCheckFunc {
 	return func(s *terraform.State) error {
@@ -283,4 +321,82 @@ resource "pritunl_server" "test" {
   status           = "online"
 }
 `, name, port, octet)
+}
+
+// startWatchingProxy passes every request to Pritunl. It records whether a
+// read of a server answered "pending", and reads the server before it
+// forwards each start, recording the status the start was sent in.
+type startWatchingProxy struct {
+	*httptest.Server
+
+	mu            sync.Mutex
+	pendingRead   bool
+	startStatuses []string
+}
+
+func newStartWatchingProxy(t *testing.T, target string) *startWatchingProxy {
+	t.Helper()
+
+	upstream, err := url.Parse(target)
+	if err != nil {
+		t.Fatalf("PRITUNL_URL: %s", err)
+	}
+
+	reverse := httputil.NewSingleHostReverseProxy(upstream)
+	reverse.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+
+	p := &startWatchingProxy{}
+	reverse.ModifyResponse = func(resp *http.Response) error {
+		if resp.Request.Method != http.MethodGet || strings.Count(strings.Trim(resp.Request.URL.Path, "/"), "/") != 1 || !strings.HasPrefix(resp.Request.URL.Path, "/server/") {
+			return nil
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return err
+		}
+		resp.Body = io.NopCloser(strings.NewReader(string(body)))
+		if strings.Contains(string(body), `"status": "pending"`) || strings.Contains(string(body), `"status":"pending"`) {
+			p.mu.Lock()
+			p.pendingRead = true
+			p.mu.Unlock()
+		}
+		return nil
+	}
+
+	p.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/operation/start") {
+			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/server/"), "/operation/start")
+			status := "unread"
+			if server, err := testClient.GetServer(id); err == nil {
+				status = server.Status
+			}
+			p.mu.Lock()
+			p.startStatuses = append(p.startStatuses, status)
+			p.mu.Unlock()
+		}
+		reverse.ServeHTTP(w, r)
+	}))
+	t.Cleanup(p.Close)
+
+	return p
+}
+
+// check makes sure the server was seen pending, was started, and never while
+// it read pending.
+func (p *startWatchingProxy) check(*terraform.State) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.pendingRead {
+		return fmt.Errorf("the server never read pending: the DH parameter pool was not empty when it was created")
+	}
+	if len(p.startStatuses) == 0 {
+		return fmt.Errorf("no start request went through the proxy")
+	}
+	for _, status := range p.startStatuses {
+		if status == pritunl.ServerStatusPending {
+			return fmt.Errorf("a start was sent while the server read pending: %v", p.startStatuses)
+		}
+	}
+	return nil
 }

@@ -2,32 +2,47 @@ package pritunl
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"time"
 )
 
 // What a start of a server proves, read from the Pritunl source
-// (pritunl/server/server.py, Server.start, and pritunl/server/instance.py):
+// (pritunl/server/server.py, Server.start and Server.generate_dh_param,
+// pritunl/queues/dh_params.py, pritunl/server/instance.py), the same in 1.32
+// and 1.34:
 //
+//   - A server reads "pending" until its DH parameters are stored. Pritunl
+//     keeps a pool of server_pool_size (3 by default) pre-generated sets; a
+//     server created while the pool is empty waits for a set generated for it.
+//   - A start of a pending server returns 200 without starting anything. When
+//     no generation for the server is queued, it takes a set out of the pool
+//     into memory and never stores it, so the set is lost and the server stays
+//     pending. A pending server is therefore never sent a start.
 //   - The start marks the server online in the database as its first step,
 //     before any instance runs, then waits for an instance to report that it
 //     started: up to 4 seconds and then up to vpn.op_timeout (25 seconds by
 //     default). When none does, it marks the server offline again and fails
-//     with "Server start timed out"; the instance that comes up late finds its
-//     startup document gone and stops ("Startup doc lost, stopping server").
+//     with "Server start timed out", answered as a 500 without an error
+//     document of the API.
 //   - A start of a server whose status is not offline returns 200 at once
 //     without doing anything: a second start sent while the first one still
 //     waits is answered 200 even when the first one then fails.
-//   - A start of a server whose DH parameters are not generated yet only
-//     queues their generation and returns 200; the server reads "pending".
 //
 // So neither a 200 nor an "online" read right after the start proves that the
-// server runs. StartServerOnline sends the start once at a time and reads the
-// server back until it is online in a way that cannot be reverted.
+// server runs. StartServerOnline waits for the DH parameters without sending
+// anything, sends the start once at a time and reads the server back until it
+// is online in a way that cannot be reverted.
 var (
-	// DefaultServerStartTimeout is how long StartServerOnline keeps trying when
-	// the caller gives no window.
+	// DefaultServerStartTimeout is how long StartServerOnline keeps trying to
+	// start a server that has its DH parameters when the caller gives no
+	// window.
 	DefaultServerStartTimeout = 5 * time.Minute
+
+	// DefaultServerDhTimeout is how long StartServerOnline waits for a pending
+	// server to get its DH parameters when the caller gives no window.
+	DefaultServerDhTimeout = 10 * time.Minute
 
 	// serverStartSettle is how long a server must have been online, by the
 	// uptime Pritunl reports, before a start whose answer was lost is taken as
@@ -41,38 +56,53 @@ var (
 )
 
 // StartServerOnline starts a server and returns once Pritunl runs it, or an
-// error that names the server once window has passed without that.
+// error that names the server.
+//
+// It reads the server first. While the server reads "pending" it sends no
+// start and waits, up to dhWindow from the beginning of the call, for the DH
+// parameters; when the server still reads pending then, it returns a
+// *ServerDhPendingError. Once the server has them, the start has its own
+// window, starting then.
 //
 // The server counts as running when it reads "online" and either every start
 // of this call was answered and the last one with 200, or it has been online
 // longer than serverStartSettle, the time Pritunl takes at most to revert a
-// start that got no instance up. After a start whose answer was lost, only the
-// settle time confirms: that request may begin in Pritunl at any later moment,
-// and a start sent while it runs is answered 200 without doing anything.
+// start that got no instance up. After a start whose answer never came (the
+// connection dropped, or pritunl-web answered 502, 503 or 504 for the
+// backend), only the settle time confirms: that request may begin in Pritunl
+// at any later moment, and a start sent while it runs is answered 200 without
+// doing anything.
 //
-// A start that fails transiently (the connection drops or is refused, a 5xx
-// that is not an error document of the API, "Server start timed out"
-// included) leaves its outcome unknown: the server is read back, and started
-// again once it reads "offline", which is also what happens when a server
-// that was started stops again. A server that reads "pending" waits for its
-// DH parameters and is started once they are there. A failure that is not
-// transient (an error document of the API, a 4xx, a certificate that does not
-// verify, the context ending) is returned at once.
+// A start Pritunl answered with a 5xx that is not an error document of the API
+// ("Server start timed out") is over: the server is read back and started
+// again once it reads offline, which is also what happens when a server that
+// was started stops again. A start that got no answer is handled the same way,
+// under the settle rule above. A failure that is not transient (an error
+// document of the API, a 4xx, a certificate that does not verify, the context
+// ending) is returned at once.
 //
-// window bounds the whole call: every request is bound to it, so a request
+// Each window bounds its phase: every request is bound to it, so a request
 // that hangs or a read the transport retries through a restart of the web
 // server ends when it closes, and nothing is sent once it has closed. ctx
 // ending (Terraform interrupted, or the timeout of the resource) ends the call
 // as well.
-func StartServerOnline(ctx context.Context, c Client, serverId string, window time.Duration) error {
+func StartServerOnline(ctx context.Context, c Client, serverId string, window, dhWindow time.Duration) error {
 	if window <= 0 {
 		window = DefaultServerStartTimeout
 	}
+	if dhWindow <= 0 {
+		dhWindow = DefaultServerDhTimeout
+	}
+
+	progress := serverStartProgress{id: serverId, window: window}
+
+	if _, err := waitServerDhParams(ctx, c, &progress, dhWindow); err != nil {
+		return err
+	}
+
 	deadline := time.Now().Add(window)
 	windowCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
-
-	progress := serverStartProgress{id: serverId, window: window}
 
 	// stopped tells why a request failed when the call itself has to end: ctx
 	// ended, or the window closed under the request
@@ -86,8 +116,8 @@ func StartServerOnline(ctx context.Context, c Client, serverId string, window ti
 		return nil
 	}
 
-	// unsure is set once a start of this call failed transiently: its request
-	// may still be on its way to Pritunl, or queued there, and begin after any
+	// unsure is set once a start of this call got no answer: its request may
+	// still be on its way to Pritunl, or queued there, and begin after any
 	// read, so no later 200 proves anything and only the settle time confirms
 	// the server for the rest of the call. confirmed is set when a start was
 	// answered 200 before that ever happened.
@@ -106,6 +136,11 @@ func StartServerOnline(ctx context.Context, c Client, serverId string, window ti
 				confirmed = !unsure
 			case stopped() != nil:
 				return stopped()
+			case isAnsweredStartFailure(err):
+				// Pritunl ran the start and gave it up: the server is back
+				// offline and nothing of this request is left in flight
+				confirmed = false
+				progress.lastErr = err
 			case isTransientReconciliation(err):
 				unsure = true
 				confirmed = false
@@ -131,8 +166,8 @@ func StartServerOnline(ctx context.Context, c Client, serverId string, window ti
 				needStart = true
 				confirmed = false
 			default:
-				// pending: the DH parameters are being generated, and the
-				// server is started once it reads offline
+				// pending again: a start now would be lost, the server is
+				// started once it reads offline
 				confirmed = false
 			}
 		case stopped() != nil:
@@ -143,25 +178,113 @@ func StartServerOnline(ctx context.Context, c Client, serverId string, window ti
 			return progress.fail(fmt.Sprintf("the server could not be read back: %s", err), err)
 		}
 
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return progress.fail("", nil)
-		}
-
-		timer := time.NewTimer(minDuration(serverStartPollInterval, remaining))
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return stopped()
-		case <-timer.C:
-		}
-
-		// the pause may end exactly when the window closes: nothing more is
-		// sent then
-		if !time.Now().Before(deadline) {
+		if !pauseServerStart(ctx, deadline) {
+			if ctx.Err() != nil {
+				return stopped()
+			}
 			return progress.fail("", nil)
 		}
 	}
+}
+
+// waitServerDhParams reads the server until it no longer reads "pending",
+// sending nothing else, for up to dhWindow. It returns the server read last.
+func waitServerDhParams(ctx context.Context, c Client, progress *serverStartProgress, dhWindow time.Duration) (*Server, error) {
+	deadline := time.Now().Add(dhWindow)
+	dhCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	var lastErr error
+	for {
+		server, err := c.GetServerContext(dhCtx, progress.id)
+		switch {
+		case err == nil:
+			progress.observe(server)
+			if server.Status != ServerStatusPending {
+				return server, nil
+			}
+		case ctx.Err() != nil:
+			return nil, progress.fail(fmt.Sprintf("interrupted: %s", ctx.Err()), ctx.Err())
+		case !time.Now().Before(deadline):
+			// the window closed under the read
+		case isTransientReconciliation(err):
+			lastErr = err
+		default:
+			return nil, progress.fail(fmt.Sprintf("the server could not be read back: %s", err), err)
+		}
+
+		if !pauseServerStart(ctx, deadline) {
+			if ctx.Err() != nil {
+				return nil, progress.fail(fmt.Sprintf("interrupted: %s", ctx.Err()), ctx.Err())
+			}
+			if progress.status != ServerStatusPending {
+				// never read: the API was unreachable for the whole window
+				reason := "the server could not be read back"
+				if lastErr != nil {
+					reason += ": " + lastErr.Error()
+				}
+				return nil, progress.fail(reason, lastErr)
+			}
+			return nil, &ServerDhPendingError{ServerId: progress.id, ServerName: progress.name, Window: dhWindow}
+		}
+	}
+}
+
+// pauseServerStart waits for the next read: false when ctx ended or deadline
+// came first, and then nothing more may be sent.
+func pauseServerStart(ctx context.Context, deadline time.Time) bool {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return false
+	}
+
+	timer := time.NewTimer(minDuration(serverStartPollInterval, remaining))
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return false
+	case <-timer.C:
+	}
+
+	// the pause may end exactly when the window closes
+	return time.Now().Before(deadline)
+}
+
+// isAnsweredStartFailure reports whether a start failed with an answer of
+// Pritunl itself: a 5xx other than the 502, 503 and 504 pritunl-web gives for
+// a backend it could not reach, and not an error document of the API (a
+// refusal). "Server start timed out" is one: Pritunl put the server back
+// offline before answering, so the request is over.
+func isAnsweredStartFailure(err error) bool {
+	var apiError *ApiError
+	if !errors.As(err, &apiError) {
+		return false
+	}
+
+	switch apiError.StatusCode {
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return false
+	}
+
+	return apiError.StatusCode >= 500 && !isApiErrorBody([]byte(apiError.Body))
+}
+
+// ServerDhPendingError reports a server that still read "pending" when the DH
+// window closed: Pritunl never stored DH parameters for it, and no start was
+// sent.
+type ServerDhPendingError struct {
+	ServerId   string
+	ServerName string
+	Window     time.Duration
+}
+
+func (e *ServerDhPendingError) Error() string {
+	server := fmt.Sprintf("server %s", e.ServerId)
+	if e.ServerName != "" {
+		server = fmt.Sprintf("server %q (%s)", e.ServerName, e.ServerId)
+	}
+
+	return fmt.Sprintf("%s still reads pending after %s: Pritunl never generated its DH parameters, so it was not started", server, e.Window)
 }
 
 // serverStartProgress is what StartServerOnline saw, for its error.
