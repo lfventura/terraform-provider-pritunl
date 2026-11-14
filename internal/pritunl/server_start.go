@@ -43,11 +43,12 @@ var (
 // StartServerOnline starts a server and returns once Pritunl runs it, or an
 // error that names the server once window has passed without that.
 //
-// The server counts as running when it reads "online" and either the start
-// that put it there was answered 200 while no earlier start of this call could
-// still be running in Pritunl, or it has been online longer than
-// serverStartSettle, the time Pritunl takes at most to revert a start that got
-// no instance up.
+// The server counts as running when it reads "online" and either every start
+// of this call was answered and the last one with 200, or it has been online
+// longer than serverStartSettle, the time Pritunl takes at most to revert a
+// start that got no instance up. After a start whose answer was lost, only the
+// settle time confirms: that request may begin in Pritunl at any later moment,
+// and a start sent while it runs is answered 200 without doing anything.
 //
 // A start that fails transiently (the connection drops or is refused, a 5xx
 // that is not an error document of the API, "Server start timed out"
@@ -85,8 +86,11 @@ func StartServerOnline(ctx context.Context, c Client, serverId string, window ti
 		return nil
 	}
 
-	// unsure is set while a start whose outcome is unknown may still be running
-	// in Pritunl; confirmed is set when a start was answered 200 while none was
+	// unsure is set once a start of this call failed transiently: its request
+	// may still be on its way to Pritunl, or queued there, and begin after any
+	// read, so no later 200 proves anything and only the settle time confirms
+	// the server for the rest of the call. confirmed is set when a start was
+	// answered 200 before that ever happened.
 	needStart := true
 	unsure := false
 	confirmed := false
@@ -122,10 +126,9 @@ func StartServerOnline(ctx context.Context, c Client, serverId string, window ti
 					return nil
 				}
 			case ServerStatusOffline:
-				// no start is running: Pritunl marks the server online as the
-				// first step of a start and offline again when it fails
+				// no start runs right now: Pritunl marks the server online as
+				// the first step of a start and offline again when it fails
 				needStart = true
-				unsure = false
 				confirmed = false
 			default:
 				// pending: the DH parameters are being generated, and the

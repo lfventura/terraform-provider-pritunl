@@ -92,21 +92,22 @@ func TestStartServerOnlineStartedThenStoppedIsStartedAgain(t *testing.T) {
 	}
 }
 
-// Starts that fail transiently are sent again once the server reads offline,
-// and the 200 that finally comes is proof, since no earlier start runs.
+// Starts that fail transiently are sent again once the server reads offline;
+// after them the server is confirmed by the settle time, not by the 200 that
+// finally comes.
 func TestStartServerOnlineTransientFailuresThenStarted(t *testing.T) {
 	shortenServerStart(t)
 	dropped := &syscallError{syscall.ECONNRESET}
 	instance := &startingInstance{
 		starts: []error{webRestarting, dropped, startTimedOut, nil},
-		reads:  []Server{offline, offline, offline, online(1)},
+		reads:  []Server{offline, offline, offline, online(1), online(20), online(40)},
 	}
 
 	if err := StartServerOnline(context.Background(), instance, "srv", time.Second); err != nil {
 		t.Fatal(err)
 	}
-	if instance.startCalls != 4 {
-		t.Fatalf("4 starts expected, got %d", instance.startCalls)
+	if instance.startCalls != 4 || instance.readCalls != 6 {
+		t.Fatalf("4 starts and 6 reads expected, got %d and %d", instance.startCalls, instance.readCalls)
 	}
 }
 
@@ -115,13 +116,12 @@ func TestStartServerOnlineTransientFailuresThenStarted(t *testing.T) {
 // the start up and puts the server back offline. A 200 to a start sent while
 // the first may still run proves nothing, so online is only trusted once it
 // held past the settle time; until then the revert is waited for and the
-// server started again, and the 200 to that start is proof: nothing else runs
-// once the server reads offline.
+// server started again, and confirmed by the settle time too.
 func TestStartServerOnlineLostAnswerWaitsOutTheRevert(t *testing.T) {
 	shortenServerStart(t)
 	instance := &startingInstance{
 		starts: []error{webRestarting, nil},
-		reads:  []Server{online(3), online(10), online(28), offline, online(1)},
+		reads:  []Server{online(3), online(10), online(28), offline, online(1), online(41)},
 	}
 
 	if err := StartServerOnline(context.Background(), instance, "srv", time.Second); err != nil {
@@ -130,8 +130,27 @@ func TestStartServerOnlineLostAnswerWaitsOutTheRevert(t *testing.T) {
 	if instance.startCalls != 2 {
 		t.Fatalf("the reverted start must be sent again, got %d starts", instance.startCalls)
 	}
-	if instance.readCalls != 5 {
-		t.Fatalf("online must hold past the settle time or follow a start answered 200, got %d reads", instance.readCalls)
+	if instance.readCalls != 6 {
+		t.Fatalf("online must hold past the settle time, got %d reads", instance.readCalls)
+	}
+}
+
+// The lost request reaches Pritunl only after the server read offline: the
+// retry is answered 200 without doing anything while the lost start runs, and
+// that start then times out. The 200 confirms nothing; the revert is seen and
+// the server started again.
+func TestStartServerOnlineLostRequestBeginsAfterTheOfflineRead(t *testing.T) {
+	shortenServerStart(t)
+	instance := &startingInstance{
+		starts: []error{webRestarting, nil, nil},
+		reads:  []Server{offline, online(1), online(15), offline, online(1), online(40)},
+	}
+
+	if err := StartServerOnline(context.Background(), instance, "srv", time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if instance.startCalls != 3 || instance.readCalls != 6 {
+		t.Fatalf("3 starts and 6 reads expected, got %d and %d", instance.startCalls, instance.readCalls)
 	}
 }
 

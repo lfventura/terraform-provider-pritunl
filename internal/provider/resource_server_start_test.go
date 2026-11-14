@@ -70,6 +70,9 @@ func TestAccPritunlServerStatusOnline(t *testing.T) {
 // reverted. It needs the docker container of the instance, named by
 // PRITUNL_ACC_CONTAINER, to install the wrapper.
 func TestAccPritunlServerStartLostAndTimedOut(t *testing.T) {
+	if os.Getenv("TF_ACC") == "" {
+		t.Skip("TF_ACC is not set: acceptance tests are skipped")
+	}
 	container := os.Getenv("PRITUNL_ACC_CONTAINER")
 	if container == "" {
 		t.Skip("PRITUNL_ACC_CONTAINER is not set: the test needs the docker container of the instance")
