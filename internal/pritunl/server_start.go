@@ -264,12 +264,23 @@ func isAnsweredStartFailure(err error) bool {
 		return false
 	}
 
-	switch apiError.StatusCode {
-	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+	var fatal fatalError
+	if errors.As(err, &fatal) || isGatewayStatus(apiError.StatusCode) {
 		return false
 	}
 
 	return apiError.StatusCode >= 500 && !isApiErrorBody([]byte(apiError.Body))
+}
+
+// isGatewayStatus reports the statuses pritunl-web answers for a backend it
+// could not reach: the request may or may not have been served.
+func isGatewayStatus(status int) bool {
+	switch status {
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+
+	return false
 }
 
 // ServerDhPendingError reports a server that still read "pending" when the DH

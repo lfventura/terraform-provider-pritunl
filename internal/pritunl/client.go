@@ -731,12 +731,19 @@ func (c client) StartServerContext(ctx context.Context, serverId string) error {
 
 	// the status line is the answer: a body cut short changes neither a 200
 	// nor a refusal into a start that got no answer
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		return newApiError("starting the server", resp.StatusCode, body)
+	body, readErr := io.ReadAll(resp.Body)
+	if resp.StatusCode == 200 {
+		return nil
 	}
 
-	return nil
+	apiError := newApiError("starting the server", resp.StatusCode, body)
+	if readErr != nil && !isGatewayStatus(resp.StatusCode) {
+		// without the whole body an answer of Pritunl cannot be told apart
+		// from a refusal: it is returned as it is, and not retried
+		return fatalError{fmt.Errorf("%w; the body could not be read whole: %s", apiError, readErr)}
+	}
+
+	return apiError
 }
 
 func (c client) StopServer(serverId string) error {

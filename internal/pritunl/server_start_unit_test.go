@@ -559,9 +559,10 @@ func TestStartServerOnlineDhWindowClosesOnAFailedRead(t *testing.T) {
 
 // A start whose answer arrived with its body cut short keeps the status of
 // the answer: a refusal stays a refusal and is not taken for a start that got
-// no answer, and a 200 stays a 200.
+// no answer, a 500 that cannot be read whole is not retried, and a 200 stays a
+// 200.
 func TestStartServerTruncatedBodyKeepsTheStatus(t *testing.T) {
-	for _, status := range []int{http.StatusNotFound, http.StatusOK} {
+	for _, status := range []int{http.StatusNotFound, http.StatusInternalServerError, http.StatusOK} {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Length", "100")
 			w.WriteHeader(status)
@@ -593,5 +594,21 @@ func TestStartServerTruncatedBodyKeepsTheStatus(t *testing.T) {
 		if isTransientReconciliation(err) || isAnsweredStartFailure(err) {
 			t.Fatalf("a refusal cut short must stay a refusal, got %v", err)
 		}
+	}
+}
+
+// A 500 whose body could not be read whole ends the call at once with its
+// status: it may be a refusal, and is not taken for an answered failure.
+func TestStartServerOnlineTruncated500FailsAtOnce(t *testing.T) {
+	shortenServerStart(t)
+	cut := fatalError{newApiError("starting the server", http.StatusInternalServerError, []byte(`{"error": "unkn`))}
+	instance := &startingInstance{starts: []error{cut}, reads: []Server{offline}}
+
+	err := StartServerOnline(context.Background(), instance, "srv", time.Minute, time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "the start was refused") || !strings.Contains(err.Error(), "500") {
+		t.Fatalf("the truncated 500 must end the call, got %v", err)
+	}
+	if instance.startCalls != 1 {
+		t.Fatalf("one start expected, got %d", instance.startCalls)
 	}
 }
