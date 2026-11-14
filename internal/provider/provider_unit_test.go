@@ -24,6 +24,9 @@ func TestParseServerStartTimeout(t *testing.T) {
 }
 
 func TestProviderDefaultServerStartTimeout(t *testing.T) {
+	// the environment override would replace the default this test checks
+	t.Setenv("PRITUNL_SERVER_START_TIMEOUT", "")
+
 	schema := Provider().Schema["server_start_timeout"]
 	value, err := schema.DefaultFunc()
 	if err != nil {
