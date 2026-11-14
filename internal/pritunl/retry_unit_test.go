@@ -769,3 +769,64 @@ func TestConcurrentCreatesOfOneIdentityDoNotAdoptEachOther(t *testing.T) {
 		}
 	}
 }
+
+// A route that exists is the one asked for only when it holds everything the
+// request set.
+func TestRoutesPresentComparesEveryAttributeTheRequestSet(t *testing.T) {
+	live := []Route{{Network: "10.1.0.0/24", Comment: "a", Metric: "100", NatInterface: "eth1"}}
+
+	cases := map[string]struct {
+		want Route
+		held bool
+	}{
+		"the same":                 {Route{Network: "10.1.0.0/24", Comment: "a", Metric: "100", NatInterface: "eth1"}, true},
+		"fewer attributes":         {Route{Network: "10.1.0.0/24", Comment: "a"}, true},
+		"advertise still off":      {Route{Network: "10.1.0.0/24", Comment: "a", Advertise: true}, false},
+		"another metric":           {Route{Network: "10.1.0.0/24", Comment: "a", Metric: "200"}, false},
+		"another nat interface":    {Route{Network: "10.1.0.0/24", Comment: "a", NatInterface: "eth2"}, false},
+		"a netmap that is not set": {Route{Network: "10.1.0.0/24", Comment: "a", NatNetmap: "10.2.0.0/24"}, false},
+		"a vpc that is not set":    {Route{Network: "10.1.0.0/24", Comment: "a", VpcID: "vpc-1", VpcRegion: "r"}, false},
+		"nat still off":            {Route{Network: "10.1.0.0/24", Comment: "a", Nat: true}, false},
+		"another comment":          {Route{Network: "10.1.0.0/24", Comment: "b"}, false},
+		"another network":          {Route{Network: "10.9.0.0/24", Comment: "a"}, false},
+	}
+
+	for name, c := range cases {
+		if got := routesPresent(live, []Route{c.want}); got != c.held {
+			t.Errorf("%s: routesPresent = %v, want %v", name, got, c.held)
+		}
+	}
+}
+
+// A body the restart cut short is a failure of the connection, which is worth
+// another try, and not an answer that cannot be decoded.
+func TestReadsKeepTheErrorOfATruncatedBody(t *testing.T) {
+	fastRetry(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1000")
+		w.Write([]byte(`[{"id": "a"`))
+		w.(http.Flusher).Flush()
+		dropConnection(w)
+	}))
+	defer server.Close()
+	transportRetryWindow = 50 * time.Millisecond
+
+	apiClient := NewClient(server.URL, "token", "secret", false)
+
+	reads := map[string]func() error{
+		"GetServers":       func() error { _, err := apiClient.GetServers(); return err },
+		"GetServer":        func() error { _, err := apiClient.GetServer("a"); return err },
+		"GetOrganizations": func() error { _, err := apiClient.GetOrganizations(); return err },
+		"GetRoutes":        func() error { _, err := apiClient.GetRoutesByServer("a"); return err },
+		"GetUser":          func() error { _, err := apiClient.GetUser("a", "o"); return err },
+		"GetAdmins":        func() error { _, err := apiClient.GetAdministrators(); return err },
+	}
+
+	for name, read := range reads {
+		err := read()
+		if err == nil || !isTransientError(err) {
+			t.Errorf("%s: expected a transient error for a truncated body, got %v", name, err)
+		}
+	}
+}

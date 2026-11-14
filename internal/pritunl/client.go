@@ -128,7 +128,10 @@ func (c client) GetOrganizations() ([]Organization, error) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("GetOrganizations: Error on reading the response: %w", err)
+	}
 	if resp.StatusCode != 200 {
 		return nil, newApiError("getting the organization", resp.StatusCode, body)
 	}
@@ -274,7 +277,10 @@ func (c client) GetServer(id string) (*Server, error) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("GetServer: Error on reading the response: %w", err)
+	}
 	if resp.StatusCode != 200 {
 		return nil, newApiError("getting the server", resp.StatusCode, body)
 	}
@@ -299,7 +305,10 @@ func (c client) GetServers() ([]Server, error) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("GetServers: Error on reading the response: %w", err)
+	}
 	if resp.StatusCode != 200 {
 		return nil, newApiError("getting servers", resp.StatusCode, body)
 	}
@@ -731,7 +740,10 @@ func (c client) GetRoutesByServer(serverId string) ([]Route, error) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("GetRoutesByServer: Error on reading the response: %w", err)
+	}
 	if resp.StatusCode != 200 {
 		return nil, newApiError("getting routes on the server", resp.StatusCode, body)
 	}
@@ -801,12 +813,27 @@ func routesPresent(live, wanted []Route) bool {
 
 	for _, want := range wanted {
 		got, found := liveByNetwork[want.Network]
-		if !found || got.Nat != want.Nat || got.NetGateway != want.NetGateway || got.Comment != want.Comment {
+		if !found || !routeHolds(got, want) {
 			return false
 		}
 	}
 
 	return true
+}
+
+// routeHolds reports whether a live route holds what a request asked of it:
+// the flags and the comment always, since false and empty are values of their
+// own, and every other writable attribute the request set.
+func routeHolds(live, want Route) bool {
+	return live.Nat == want.Nat &&
+		live.NetGateway == want.NetGateway &&
+		live.Comment == want.Comment &&
+		(!want.Advertise || live.Advertise) &&
+		(want.Metric == "" || live.Metric == want.Metric) &&
+		(want.VpcID == "" || live.VpcID == want.VpcID) &&
+		(want.VpcRegion == "" || live.VpcRegion == want.VpcRegion) &&
+		(want.NatInterface == "" || live.NatInterface == want.NatInterface) &&
+		(want.NatNetmap == "" || live.NatNetmap == want.NatNetmap)
 }
 
 // post sends one POST request, with the status and the body of the answer, or
@@ -886,7 +913,10 @@ func (c client) GetUser(id string, orgId string) (*User, error) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("GetUser: Error on reading the response: %w", err)
+	}
 	if resp.StatusCode != 200 {
 		return nil, newApiError("getting the user", resp.StatusCode, body)
 	}
@@ -1232,7 +1262,10 @@ func (c client) GetAdministrators() ([]Administrator, error) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("GetAdministrators: Error on reading the response: %w", err)
+	}
 	if resp.StatusCode != 200 {
 		return nil, newApiError("getting the administrators", resp.StatusCode, body)
 	}
