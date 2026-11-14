@@ -62,7 +62,8 @@ var (
 // start and waits, up to dhWindow from the beginning of the call, for the DH
 // parameters; when the server still reads pending then, it returns a
 // *ServerDhPendingError. Once the server has them, the start has its own
-// window, starting then.
+// window, starting then. A server that already reads online is not started:
+// it is confirmed by the settle time, as after a start that got no answer.
 //
 // The server counts as running when it reads "online" and either every start
 // of this call was answered and the last one with 200, or it has been online
@@ -96,7 +97,8 @@ func StartServerOnline(ctx context.Context, c Client, serverId string, window, d
 
 	progress := serverStartProgress{id: serverId, window: window}
 
-	if _, err := waitServerDhParams(ctx, c, &progress, dhWindow); err != nil {
+	first, err := waitServerDhParams(ctx, c, &progress, dhWindow)
+	if err != nil {
 		return err
 	}
 
@@ -119,10 +121,13 @@ func StartServerOnline(ctx context.Context, c Client, serverId string, window, d
 	// unsure is set once a start of this call got no answer: its request may
 	// still be on its way to Pritunl, or queued there, and begin after any
 	// read, so no later 200 proves anything and only the settle time confirms
-	// the server for the rest of the call. confirmed is set when a start was
-	// answered 200 before that ever happened.
-	needStart := true
-	unsure := false
+	// the server for the rest of the call. It is also set when the server
+	// already reads online before this call sent anything: a start of someone
+	// else may still be waiting for its instance, and a start sent now would
+	// be answered 200 without doing anything. confirmed is set when a start
+	// was answered 200 while unsure was not set.
+	needStart := first.Status != ServerStatusOnline
+	unsure := first.Status == ServerStatusOnline
 	confirmed := false
 
 	for {
@@ -194,9 +199,13 @@ func waitServerDhParams(ctx context.Context, c Client, progress *serverStartProg
 	dhCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
-	var lastErr error
+	// readErr is the failure of the latest read, nil when it read the server:
+	// only a server that read pending at the end of the window is reported as
+	// one that never got its DH parameters
+	var readErr error
 	for {
 		server, err := c.GetServerContext(dhCtx, progress.id)
+		readErr = err
 		switch {
 		case err == nil:
 			progress.observe(server)
@@ -208,7 +217,6 @@ func waitServerDhParams(ctx context.Context, c Client, progress *serverStartProg
 		case !time.Now().Before(deadline):
 			// the window closed under the read
 		case isTransientReconciliation(err):
-			lastErr = err
 		default:
 			return nil, progress.fail(fmt.Sprintf("the server could not be read back: %s", err), err)
 		}
@@ -217,13 +225,8 @@ func waitServerDhParams(ctx context.Context, c Client, progress *serverStartProg
 			if ctx.Err() != nil {
 				return nil, progress.fail(fmt.Sprintf("interrupted: %s", ctx.Err()), ctx.Err())
 			}
-			if progress.status != ServerStatusPending {
-				// never read: the API was unreachable for the whole window
-				reason := "the server could not be read back"
-				if lastErr != nil {
-					reason += ": " + lastErr.Error()
-				}
-				return nil, progress.fail(reason, lastErr)
+			if readErr != nil {
+				return nil, progress.fail(fmt.Sprintf("the server could not be read back while it was waited for: %s", readErr), readErr)
 			}
 			return nil, &ServerDhPendingError{ServerId: progress.id, ServerName: progress.name, Window: dhWindow}
 		}

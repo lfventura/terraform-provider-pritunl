@@ -492,3 +492,67 @@ func TestStartServerOnlineSendsNothingAfterTheWindow(t *testing.T) {
 		t.Fatalf("nothing may be sent after the window, got %d starts and %d reads", instance.startCalls, instance.readCalls)
 	}
 }
+
+// A server that already reads online before anything was sent may be running
+// a start of someone else that can still fail: it is not started (the start
+// would be a no-op answered 200) and is confirmed by the settle time only.
+func TestStartServerOnlineAlreadyOnlineWaitsForTheSettleTime(t *testing.T) {
+	shortenServerStart(t)
+	instance := &startingInstance{reads: []Server{online(2), online(10), online(41)}}
+
+	if err := StartServerOnline(context.Background(), instance, "srv", time.Second, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if instance.startCalls != 0 || instance.readCalls != 3 {
+		t.Fatalf("no start and 3 reads expected, got %d starts and %d reads", instance.startCalls, instance.readCalls)
+	}
+}
+
+// The start of someone else fails after the first read: the server is
+// started, and confirmed by the settle time, since that start was never ours.
+func TestStartServerOnlineAlreadyOnlineThenRevertedIsStarted(t *testing.T) {
+	shortenServerStart(t)
+	instance := &startingInstance{reads: []Server{online(2), offline, online(1), online(40)}}
+
+	if err := StartServerOnline(context.Background(), instance, "srv", time.Second, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if instance.startCalls != 1 || instance.readCalls != 4 {
+		t.Fatalf("one start and 4 reads expected, got %d starts and %d reads", instance.startCalls, instance.readCalls)
+	}
+}
+
+// failingReads answers the first reads with servers, then fails every read.
+type failingReads struct {
+	startingInstance
+	good int
+}
+
+func (f *failingReads) GetServerContext(ctx context.Context, id string) (*Server, error) {
+	if f.readCalls >= f.good {
+		f.readCalls++
+		return nil, &syscallError{syscall.ECONNREFUSED}
+	}
+	return f.startingInstance.GetServerContext(ctx, id)
+}
+
+// A server read pending and then not read at all when the DH window closes is
+// reported as unreadable, not as one that never got its DH parameters.
+func TestStartServerOnlineDhWindowClosesOnAFailedRead(t *testing.T) {
+	shortenServerStart(t)
+	instance := &failingReads{startingInstance: startingInstance{reads: []Server{pending}}, good: 1}
+
+	err := StartServerOnline(context.Background(), instance, "srv", time.Minute, 30*time.Millisecond)
+
+	var dhErr *ServerDhPendingError
+	if errors.As(err, &dhErr) {
+		t.Fatalf("a failed last read must not be reported as a DH failure, got %v", err)
+	}
+	var startErr *ServerStartError
+	if !errors.As(err, &startErr) || !strings.Contains(err.Error(), "could not be read back") {
+		t.Fatalf("a ServerStartError about the read expected, got %v", err)
+	}
+	if instance.startCalls != 0 {
+		t.Fatalf("nothing may be started, got %d starts", instance.startCalls)
+	}
+}
