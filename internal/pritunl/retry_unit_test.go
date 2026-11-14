@@ -672,3 +672,100 @@ func TestActivateSubscriptionRetriesAfterATransientFailure(t *testing.T) {
 		t.Fatalf("expected the two failed attempts and the one that went through, got %d", instance.posts)
 	}
 }
+
+// Once the window is closed nothing is sent again, however the pause fell.
+func TestRetryCreateDoesNotSendAgainAfterTheWindow(t *testing.T) {
+	fastRetry(t)
+	transportRetryWindow = 50 * time.Millisecond
+	transportRetryFirstWait = 200 * time.Millisecond
+
+	attempts := 0
+	start := time.Now()
+	result, adopted, err := retryCreate(
+		func() attemptResult {
+			attempts++
+
+			return attemptResult{status: 502}
+		},
+		func() (bool, error) { return false, nil },
+	)
+
+	if err != nil || adopted || result.status != 502 {
+		t.Fatalf("expected the last failure, got %+v adopted=%v err=%v", result, adopted, err)
+	}
+	if attempts != 1 {
+		t.Fatalf("the window closed during the pause, yet the request was sent %d times", attempts)
+	}
+	if elapsed := time.Since(start); elapsed > 150*time.Millisecond {
+		t.Fatalf("the pause outlived the window: %s", elapsed)
+	}
+}
+
+// A state that cannot be read for a reason waiting does not change is the
+// error to report, not the 502 that came before it.
+func TestCreateStopsOnANonTransientReconciliationError(t *testing.T) {
+	fastRetry(t)
+
+	posts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			if posts == 0 {
+				json.NewEncoder(w).Encode([]Organization{})
+
+				return
+			}
+			w.WriteHeader(401)
+			w.Write([]byte(`{"error": "unauthorized", "error_msg": "Unauthorized"}`))
+
+			return
+		}
+		posts++
+		w.WriteHeader(502)
+	}))
+	defer server.Close()
+
+	start := time.Now()
+	_, err := NewClient(server.URL, "token", "secret", false).CreateOrganization("acme")
+
+	var apiError *ApiError
+	if !errors.As(err, &apiError) || apiError.StatusCode != 401 {
+		t.Fatalf("expected the 401 of the reconciliation, got %v", err)
+	}
+	if posts != 1 {
+		t.Fatalf("expected the one request that failed, got %d", posts)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("a refused login must not be retried until the window closes")
+	}
+}
+
+// Two creates that could be taken for one another run one after the other, so
+// the failure of one never adopts the object the other made.
+func TestConcurrentCreatesOfOneIdentityDoNotAdoptEachOther(t *testing.T) {
+	for round := 0; round < 20; round++ {
+		instance := &fakeInstance{failures: []string{"502"}}
+		apiClient := newFakeClient(t, instance)
+
+		ids := make([]string, 2)
+		var wg sync.WaitGroup
+		for i := range ids {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+
+				organization, err := apiClient.CreateOrganization("acme")
+				if err != nil {
+					t.Error(err)
+
+					return
+				}
+				ids[i] = organization.ID
+			}(i)
+		}
+		wg.Wait()
+
+		if ids[0] == "" || ids[0] == ids[1] || len(instance.organizations) != 2 {
+			t.Fatalf("round %d: expected two organizations of their own, got %v among %+v", round, ids, instance.organizations)
+		}
+	}
+}

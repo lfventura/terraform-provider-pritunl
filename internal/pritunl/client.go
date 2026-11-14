@@ -124,13 +124,13 @@ func (c client) GetOrganizations() ([]Organization, error) {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("GetOrganization: Error on HTTP request: %s", err)
+		return nil, fmt.Errorf("GetOrganizations: Error on HTTP request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("Non-200 response on getting the organization\nbody=%s", body)
+		return nil, newApiError("getting the organization", resp.StatusCode, body)
 	}
 
 	var organizations []Organization
@@ -145,6 +145,8 @@ func (c client) GetOrganizations() ([]Organization, error) {
 
 func (c client) CreateOrganization(name string) (*Organization, error) {
 	var jsonStr = []byte(`{"name": "` + name + `"}`)
+
+	defer lockCreate("organization|" + name)()
 
 	known, err := c.organizationIdsByName(name)
 	if err != nil {
@@ -183,7 +185,7 @@ func (c client) CreateOrganization(name string) (*Organization, error) {
 		},
 	)
 	if err != nil {
-		return nil, fmt.Errorf("CreateOrganization: %s", err)
+		return nil, fmt.Errorf("CreateOrganization: %w", err)
 	}
 	if adopted {
 		return created, nil
@@ -268,13 +270,13 @@ func (c client) GetServer(id string) (*Server, error) {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("GetServer: Error on HTTP request: %s", err)
+		return nil, fmt.Errorf("GetServer: Error on HTTP request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("Non-200 response on getting the server\nbody=%s", body)
+		return nil, newApiError("getting the server", resp.StatusCode, body)
 	}
 
 	var server Server
@@ -293,13 +295,13 @@ func (c client) GetServers() ([]Server, error) {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("GetServers: Error on HTTP request: %s", err)
+		return nil, fmt.Errorf("GetServers: Error on HTTP request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("Non-200 response on getting servers\nbody=%s", body)
+		return nil, newApiError("getting servers", resp.StatusCode, body)
 	}
 
 	var servers []Server
@@ -500,6 +502,8 @@ func (c client) CreateServer(serverData map[string]interface{}) (*Server, error)
 	// Pritunl takes any number of servers under one name, so a create that
 	// failed transiently is recognised by the server that was not there before
 	// it was sent and holds what it asked for
+	defer lockCreate("server|" + serverStruct.Name)()
+
 	known, err := c.serverIdsByName(serverStruct.Name)
 	if err != nil {
 		return nil, fmt.Errorf("CreateServer: %s", err)
@@ -535,7 +539,7 @@ func (c client) CreateServer(serverData map[string]interface{}) (*Server, error)
 		},
 	)
 	if err != nil {
-		return nil, fmt.Errorf("CreateServer: %s", err)
+		return nil, fmt.Errorf("CreateServer: %w", err)
 	}
 	if adopted {
 		return created, nil
@@ -723,13 +727,13 @@ func (c client) GetRoutesByServer(serverId string) ([]Route, error) {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("GetRoutesByServer: Error on HTTP request: %s", err)
+		return nil, fmt.Errorf("GetRoutesByServer: Error on HTTP request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("Non-200 response on getting routes on the server\nbody=%s", body)
+		return nil, newApiError("getting routes on the server", resp.StatusCode, body)
 	}
 
 	var routes []Route
@@ -772,7 +776,7 @@ func (c client) postRoutes(operation, serverId, url string, payload interface{},
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("%s: %s", operation, err)
+		return fmt.Errorf("%s: %w", operation, err)
 	}
 	if adopted {
 		return nil
@@ -878,13 +882,13 @@ func (c client) GetUser(id string, orgId string) (*User, error) {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("GetUser: Error on HTTP request: %s", err)
+		return nil, fmt.Errorf("GetUser: Error on HTTP request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("Non-200 response on getting the user\nbody=%s", body)
+		return nil, newApiError("getting the user", resp.StatusCode, body)
 	}
 
 	var user User
@@ -901,6 +905,8 @@ func (c client) CreateUser(newUser User) (*User, error) {
 	if err != nil {
 		return nil, fmt.Errorf("CreateUser: Error on marshalling data: %s", err)
 	}
+
+	defer lockCreate("user|" + newUser.Organization + "|" + newUser.Name)()
 
 	known, err := c.userIdsByName(newUser.Organization, newUser.Name)
 	if err != nil {
@@ -930,7 +936,7 @@ func (c client) CreateUser(newUser User) (*User, error) {
 		},
 	)
 	if err != nil {
-		return nil, fmt.Errorf("CreateUser: %s", err)
+		return nil, fmt.Errorf("CreateUser: %w", err)
 	}
 	if adopted {
 		return created, nil
@@ -973,7 +979,7 @@ func (c client) userIdsByName(organizationId, name string) ([]string, error) {
 		return nil, fmt.Errorf("Error on reading the users: %w", err)
 	}
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("Non-200 response on getting the users of the organization\ncode=%d\nbody=%s", resp.StatusCode, body)
+		return nil, newApiError("getting the users of the organization", resp.StatusCode, body)
 	}
 
 	// only what tells a user apart is decoded: the list carries far more than
@@ -1222,7 +1228,7 @@ func (c client) GetAdministrators() ([]Administrator, error) {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("GetAdministrators: Error on HTTP request: %s", err)
+		return nil, fmt.Errorf("GetAdministrators: Error on HTTP request: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -1301,6 +1307,8 @@ func (c client) CreateAdministrator(administrator Administrator) (Administrator,
 	username := administrator.String("username")
 	var created Administrator
 
+	defer lockCreate("administrator|" + username)()
+
 	existing, err := c.GetAdministrators()
 	if err != nil {
 		return nil, fmt.Errorf("CreateAdministrator: %s", err)
@@ -1337,7 +1345,7 @@ func (c client) CreateAdministrator(administrator Administrator) (Administrator,
 		},
 	)
 	if err != nil {
-		return nil, fmt.Errorf("CreateAdministrator: %s", err)
+		return nil, fmt.Errorf("CreateAdministrator: %w", err)
 	}
 	if adopted {
 		return created, nil

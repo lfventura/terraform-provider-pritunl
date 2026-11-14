@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -177,44 +178,100 @@ func (r attemptResult) transient() bool {
 // sending it again would create the object twice. So before every retry
 // settled reads the state back and reports whether the object is already
 // there, in which case the call is done and attempt is not repeated. attempt
-// runs again only while the object is verifiably absent. A failure that is
-// not transient, the answer of the API included, ends the loop at once and is
-// returned as it is, as is the last failure once the window closes.
+// runs again only while the object is verifiably absent and the window is
+// open. A failure that is not transient, the answer of the API included, ends
+// the loop at once and is returned as it is, as is the last failure once the
+// window closes.
 //
-// settled returning an error means the state could not be read right now,
-// which is the restart again, and the loop goes on; a fatalError stops it.
+// settled returning a transient error means the state could not be read right
+// now, which is the restart again, and the loop goes on. Any other error, a
+// fatalError or an answer of the API such as a refused login, stops the loop
+// and is returned: retrying cannot help, and it is the one worth reading.
 func retryCreate(attempt func() attemptResult, settled func() (bool, error)) (result attemptResult, adopted bool, err error) {
 	deadline := time.Now().Add(transportRetryWindow)
 	pause := newBackoff()
 
 	for {
 		result = attempt()
-		if !result.transient() {
-			return result, false, nil
-		}
-		if !time.Now().Before(deadline) {
+		if !result.transient() || !time.Now().Before(deadline) {
 			return result, false, nil
 		}
 
 		for {
-			time.Sleep(pause.next())
+			if remaining := time.Until(deadline); remaining > 0 {
+				time.Sleep(minDuration(pause.next(), remaining))
+			}
 
 			done, err := settled()
-			var fatal fatalError
-			if errors.As(err, &fatal) {
-				return result, false, fatal.err
+			if err == nil && done {
+				return result, true, nil
 			}
-			if err == nil {
-				if done {
-					return result, true, nil
-				}
-				break
+			if err != nil && !isTransientReconciliation(err) {
+				return result, false, fmt.Errorf("the request failed (%s) and the state could not be read back to tell whether it was served: %w", result.describe(), err)
 			}
 			if !time.Now().Before(deadline) {
 				return result, false, nil
 			}
+			if err == nil {
+				break
+			}
 		}
 	}
+}
+
+// describe says what a request came to, for the error of a call that cannot
+// tell whether the request was served.
+func (r attemptResult) describe() string {
+	if r.err != nil {
+		return r.err.Error()
+	}
+
+	return fmt.Sprintf("code=%d", r.status)
+}
+
+// isTransientReconciliation reports whether a failure to read the state back
+// is the web server being unavailable, which is worth another try, rather than
+// an answer that retrying cannot change: a refused login, a certificate that
+// does not verify, a body that cannot be read.
+func isTransientReconciliation(err error) bool {
+	var fatal fatalError
+	if errors.As(err, &fatal) {
+		return false
+	}
+
+	var apiError *ApiError
+	if errors.As(err, &apiError) {
+		return isTransientStatus(apiError.StatusCode, []byte(apiError.Body))
+	}
+
+	return isTransientError(err)
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+
+	return b
+}
+
+// createLocks serialises the creates that could be taken for one another.
+var createLocks sync.Map
+
+// lockCreate holds the lock of an identity, a kind of object with the name that
+// tells it apart, until the returned function is called. Two creates of the same
+// identity in flight at once are told apart by nothing but the order they run
+// in: after one of them failed transiently, the object the other created would
+// be taken for its own. The lock covers the whole sequence of a create, the
+// baseline read included, so each create sees exactly the objects that exist
+// when it starts and no other call of the provider creates one of its identity
+// while it runs.
+func lockCreate(identity string) func() {
+	lock, _ := createLocks.LoadOrStore(identity, &sync.Mutex{})
+	mutex := lock.(*sync.Mutex)
+	mutex.Lock()
+
+	return mutex.Unlock
 }
 
 // pickCreated tells which object a create that failed transiently made, out of
