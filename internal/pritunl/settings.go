@@ -51,6 +51,9 @@ func (s Settings) Int(key string) int {
 		return int(number)
 	case float64:
 		return int(value)
+	case int:
+		// what a write of this provider puts in the object
+		return value
 	}
 
 	return 0

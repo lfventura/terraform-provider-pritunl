@@ -27,21 +27,23 @@ const (
 	ssoDisabled = "disabled"
 )
 
-const (
-	// Pritunl schedules the web server restart shortly after answering the
-	// request, so the endpoint is given a head start before being polled and
-	// has to answer a few times in a row to be considered back
+// Pritunl schedules the web server restart shortly after answering the
+// request, so the endpoint is given a head start before being polled and has to
+// answer a few times in a row to be considered back. The restart itself takes a
+// few seconds; the timeout is what a slow instance is given before the apply
+// fails. They are variables only for the unit tests to shorten.
+var (
 	settingsRestartDelay        = 5 * time.Second
 	settingsRestartPoll         = 2 * time.Second
 	settingsRestartSettle       = time.Second
 	settingsRestartSuccesses    = 3
-	settingsRestartTimeout      = 2 * time.Minute
+	settingsRestartTimeout      = 3 * time.Minute
 	settingsRestartProbeTimeout = 10 * time.Second
 )
 
 func resourceSettings() *schema.Resource {
 	return &schema.Resource{
-		Description: "The settings resource allows managing the global settings of a Pritunl instance: the TLS certificate served by its own web console and API, the single sign-on configuration and the instance wide user and VPN toggles. It is a singleton resource: a single instance of it maps to the whole Pritunl instance and its import id is always `settings`. Every write is a read-modify-write of the complete settings object, the same way the Pritunl web console itself works: `PUT /settings` is a full replace and not a partial update, so the settings are read back from the instance immediately before each write and handed over again with the managed attributes overlaid on top of them. That is what keeps unmanaged settings such as the SMTP or monitoring configuration untouched, and only the managed attributes are ever stored in the Terraform state. Leaving an attribute out of the configuration never resets the setting behind it: the value the instance already holds is read back and handed over again, so a setting only ever changes by being configured. The one exception is `server_port`, which defaults to `443`: a configuration that leaves it out moves an instance listening elsewhere to 443, so an instance on another port sets `server_port` explicitly to keep it.",
+		Description: "The settings resource allows managing the global settings of a Pritunl instance: the TLS certificate served by its own web console and API, the single sign-on configuration and the instance wide user and VPN toggles. It is a singleton resource: a single instance of it maps to the whole Pritunl instance and its import id is always `settings`. Every write is a read-modify-write of the complete settings object, the same way the Pritunl web console itself works: `PUT /settings` is a full replace and not a partial update, so the settings are read back from the instance immediately before each write and handed over again with the managed attributes overlaid on top of them. That is what keeps unmanaged settings such as the SMTP or monitoring configuration untouched, and only the managed attributes are ever stored in the Terraform state. Leaving an attribute out of the configuration never resets the setting behind it: the value the instance already holds is read back and handed over again, so a setting only ever changes by being configured. The one exception is `server_port`, which defaults to `443`: a configuration that leaves it out moves an instance listening elsewhere to 443, so an instance on another port sets `server_port` explicitly to keep it. A write that changes the certificate, its key or the port makes Pritunl restart its web server, and the resource finishes only once the web console answers again: it polls the API until it has answered a few times in a row, for up to three minutes, and a write that changes none of them does not wait. A write that changes the port is the exception: the console is served on the new port from then on, and the `url` of the provider names the previous one, so the resource reports a warning instead of waiting. The other resources of the same apply ride out the restart: every call of the provider retries a connection that is refused, reset or closed and the answers of a web server that is unavailable or failing (`502`, `503`, `504`, and any other `5xx` that is not an error document of the API) for up to 90 seconds, while the errors of the API itself are reported at once. A call that creates something (an organization, a user, a server, a route, an administrator) reads the state back before it is sent again, so a request the restart cut short is never sent twice.",
 		Schema: map[string]*schema.Schema{
 			// the certificate fields are computed so that leaving them out of
 			// the configuration keeps the certificate of the instance as it is
@@ -53,7 +55,7 @@ func resourceSettings() *schema.Resource {
 				Computed:     true,
 				RequiredWith: []string{"server_key"},
 				StateFunc:    trimSpaceStateFunc,
-				Description:  "The certificate served by the web console and the API, as pure concatenated PEM blocks: the leaf certificate followed by the intermediate certificate(s), in that order. The root CA certificate must be left out, clients already trust it through their own trust store and only need the intermediates to build the chain. Nothing but `-----BEGIN CERTIFICATE-----` blocks may be present: the `Bag Attributes`, `subject=` and `issuer=` lines that `openssl pkcs12 -nokeys` writes in front of every block are OpenSSL specific text, not part of the PEM format, and Pritunl rejects a certificate that still carries them. Destroying the resource hands the certificate back to Pritunl, which regenerates its self-signed default; a web server that does not answer again within two minutes after that reset is reported as a warning, and the destroy completes. From then on the instance serves a certificate the provider does not trust: a later run that calls its API sets `insecure` on the provider, and a destroy with nothing left in the state, which calls no API but still configures the provider and checks its connection, sets `insecure` or turns `connection_check` off.",
+				Description:  "The certificate served by the web console and the API, as pure concatenated PEM blocks: the leaf certificate followed by the intermediate certificate(s), in that order. The root CA certificate must be left out, clients already trust it through their own trust store and only need the intermediates to build the chain. Nothing but `-----BEGIN CERTIFICATE-----` blocks may be present: the `Bag Attributes`, `subject=` and `issuer=` lines that `openssl pkcs12 -nokeys` writes in front of every block are OpenSSL specific text, not part of the PEM format, and Pritunl rejects a certificate that still carries them. Destroying the resource hands the certificate back to Pritunl, which regenerates its self-signed default; a web server that does not answer again within three minutes after that reset is reported as a warning, and the destroy completes. From then on the instance serves a certificate the provider does not trust: a later run that calls its API sets `insecure` on the provider, and a destroy with nothing left in the state, which calls no API but still configures the provider and checks its connection, sets `insecure` or turns `connection_check` off.",
 			},
 			"server_key": {
 				Type:         schema.TypeString,
@@ -489,7 +491,9 @@ func resourceCreateSettings(ctx context.Context, d *schema.ResourceData, meta in
 		return diag.FromErr(err)
 	}
 
+	before := webServerSettingsOf(settings)
 	portChanged := overlaySettings(d, settings)
+	restart := webServerSettingsOf(settings) != before
 
 	if err = apiClient.UpdateSettings(settings); err != nil {
 		return diag.FromErr(err)
@@ -497,7 +501,7 @@ func resourceCreateSettings(ctx context.Context, d *schema.ResourceData, meta in
 
 	d.SetId(settingsResourceId)
 
-	return finishSettingsWrite(ctx, d, meta, portChanged)
+	return finishSettingsWrite(ctx, d, meta, portChanged, restart)
 }
 
 // validateSsoBeforeWrite runs the cross-attribute rules of the single sign-on
@@ -597,13 +601,15 @@ func resourceUpdateSettings(ctx context.Context, d *schema.ResourceData, meta in
 		return diag.FromErr(err)
 	}
 
+	before := webServerSettingsOf(settings)
 	portChanged := overlaySettings(d, settings)
+	restart := webServerSettingsOf(settings) != before
 
 	if err = apiClient.UpdateSettings(settings); err != nil {
 		return diag.FromErr(err)
 	}
 
-	return finishSettingsWrite(ctx, d, meta, portChanged)
+	return finishSettingsWrite(ctx, d, meta, portChanged, restart)
 }
 
 // overlaySettings writes the attributes managed by this resource on top of the
@@ -760,7 +766,28 @@ func resourceDeleteSettings(ctx context.Context, d *schema.ResourceData, meta in
 	return nil
 }
 
-func finishSettingsWrite(ctx context.Context, d *schema.ResourceData, meta interface{}, portChanged bool) diag.Diagnostics {
+// webServerSettings is what Pritunl's web server is configured from: the
+// certificate it serves, its key and the port it listens on. Pritunl restarts
+// the web server when a write changes one of them, and only then.
+type webServerSettings struct {
+	cert string
+	key  string
+	port int
+}
+
+func webServerSettingsOf(settings pritunl.Settings) webServerSettings {
+	return webServerSettings{
+		cert: strings.TrimSpace(settings.String("server_cert")),
+		key:  strings.TrimSpace(settings.String("server_key")),
+		port: settings.Int("server_port"),
+	}
+}
+
+// finishSettingsWrite ends a write of the settings. restart is whether the
+// write changed the certificate, its key or the port, which is what makes
+// Pritunl restart its web server: only then is there a restart to wait for, and
+// a write that changed none of them reads the settings back at once.
+func finishSettingsWrite(ctx context.Context, d *schema.ResourceData, meta interface{}, portChanged, restart bool) diag.Diagnostics {
 	if portChanged {
 		// the web console and the API are served on another port from now on,
 		// waiting for them on the previous one or reading the settings back
@@ -772,8 +799,10 @@ func finishSettingsWrite(ctx context.Context, d *schema.ResourceData, meta inter
 		}}
 	}
 
-	if err := waitForWebServer(ctx, meta.(pritunl.Client)); err != nil {
-		return diag.FromErr(err)
+	if restart {
+		if err := waitForWebServer(ctx, meta.(pritunl.Client)); err != nil {
+			return diag.FromErr(err)
+		}
 	}
 
 	return resourceReadSettings(ctx, d, meta)

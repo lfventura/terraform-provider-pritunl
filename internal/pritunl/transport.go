@@ -24,19 +24,19 @@ type transport struct {
 	baseUrl             string
 }
 
-const (
-	// Pritunl restarts its web server right after some settings writes (a
-	// TLS certificate or port change), which surfaces to every concurrent
-	// caller as a transport error or a 5xx answer for a few seconds.
-	transportRetryWindow  = 75 * time.Second
-	transportRetryMaxWait = 10 * time.Second
-)
-
-// RoundTrip signs and sends the request, retrying transient failures —
-// transport errors and 5xx answers — until the retry window closes. Every
-// attempt signs the request again (the nonce is single-use server side)
-// and replays the body through GetBody; a request whose body cannot be
-// replayed is sent only once.
+// RoundTrip signs and sends the request, retrying transient failures until the
+// retry window closes: a connection that is refused, reset, closed or timed out
+// and the answers of a web server that is unavailable (see isTransientError and
+// isTransientStatus). The answers of the API itself, error bodies included, are
+// never retried. Every attempt signs the request again (the nonce is single-use
+// server side) and replays the body through GetBody; a request whose body
+// cannot be replayed is sent only once.
+//
+// A POST is replayed only when the attempt provably never left, a dial
+// failure: one that reached the server may have committed before the answer
+// was lost, and replaying it would create a duplicate. The callers that create
+// something retry those themselves after reading the state back (see
+// retryCreate).
 func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Host == "" {
 		u, err := url.Parse(t.baseUrl)
@@ -49,7 +49,7 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	deadline := time.Now().Add(transportRetryWindow)
-	wait := time.Second
+	pause := newBackoff()
 
 	for {
 		if req.Body != nil && req.GetBody != nil {
@@ -64,16 +64,26 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		resp, err := t.underlyingTransport.RoundTrip(req)
 
-		retriable := err != nil || resp.StatusCode >= 500
-		if req.Method == http.MethodPost {
-			// A POST that reached the server may have committed before the
-			// answer was lost, and replaying it would create a duplicate.
-			// Only an attempt that provably never left - a dial failure -
-			// retries.
-			retriable = isDialError(err)
+		var retriable bool
+		switch {
+		case req.Method == http.MethodPost:
+			retriable = isDialError(err) && isTransientError(err)
+		case err != nil:
+			retriable = isTransientError(err)
+		default:
+			var readErr error
+			retriable, resp, readErr = transientResponse(resp)
+			if readErr != nil {
+				// the body broke off while it was read: the answer is lost,
+				// like a connection that dropped
+				err = readErr
+				resp = nil
+				retriable = isTransientError(readErr)
+			}
 		}
+
 		replayable := req.Body == nil || req.GetBody != nil
-		if !retriable || !replayable || time.Now().After(deadline) {
+		if !retriable || !replayable || !time.Now().Before(deadline) {
 			return resp, err
 		}
 		if err == nil {
@@ -84,13 +94,7 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		select {
 		case <-req.Context().Done():
 			return nil, req.Context().Err()
-		case <-time.After(wait):
-		}
-		if wait < transportRetryMaxWait {
-			wait *= 2
-			if wait > transportRetryMaxWait {
-				wait = transportRetryMaxWait
-			}
+		case <-time.After(pause.next()):
 		}
 	}
 }
