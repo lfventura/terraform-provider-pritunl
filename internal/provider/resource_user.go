@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/hashicorp/go-cty/cty"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
@@ -102,10 +103,26 @@ func resourceUser() *schema.Resource {
 				Description: "Bypass secondary authentication such as the PIN and two-factor authentication. Use for server users that can't provide a two-factor code.",
 			},
 			"pin": {
-				Type:        schema.TypeString,
-				Optional:    true,
-				Sensitive:   true,
-				Description: "The PIN for user authentication.",
+				Type:          schema.TypeString,
+				Optional:      true,
+				Sensitive:     true,
+				ConflictsWith: []string{"pin_wo"},
+				Description:   "The PIN for user authentication.",
+			},
+			"pin_wo": {
+				Type:          schema.TypeString,
+				Optional:      true,
+				Sensitive:     true,
+				WriteOnly:     true,
+				ConflictsWith: []string{"pin"},
+				RequiredWith:  []string{"pin_wo_version"},
+				Description:   "Write-only form of pin (Terraform 1.11 and later): the PIN is sent to Pritunl and never stored in the state. Set on create, and sent again whenever pin_wo_version changes.",
+			},
+			"pin_wo_version": {
+				Type:         schema.TypeInt,
+				Optional:     true,
+				RequiredWith: []string{"pin_wo"},
+				Description:  "Version of pin_wo; changing it sends pin_wo to Pritunl again.",
 			},
 		},
 		CreateContext: resourceUserCreate,
@@ -180,6 +197,16 @@ func resourceUserUpdate(ctx context.Context, d *schema.ResourceData, meta interf
 	if d.HasChange("pin") {
 		if v, ok := d.GetOk("pin"); ok {
 			user.Pin = &pritunl.Pin{Secret: v.(string)}
+		}
+	}
+
+	if d.HasChange("pin_wo_version") {
+		pin, diags := writeOnlyPin(d)
+		if diags.HasError() {
+			return diags
+		}
+		if pin != "" {
+			user.Pin = &pritunl.Pin{Secret: pin}
 		}
 	}
 
@@ -314,6 +341,14 @@ func resourceUserCreate(_ context.Context, d *schema.ResourceData, meta interfac
 		}
 	}
 
+	pin, diags := writeOnlyPin(d)
+	if diags.HasError() {
+		return diags
+	}
+	if pin != "" {
+		userData.Pin = &pritunl.Pin{Secret: pin}
+	}
+
 	user, err := apiClient.CreateUser(userData)
 	if err != nil {
 		return diag.FromErr(err)
@@ -344,4 +379,17 @@ func resourceUserImport(_ context.Context, d *schema.ResourceData, meta interfac
 	}
 
 	return []*schema.ResourceData{d}, nil
+}
+
+// writeOnlyPin reads pin_wo from the configuration: a write-only value reaches
+// the provider only through the raw config and is never in the state.
+func writeOnlyPin(d *schema.ResourceData) (string, diag.Diagnostics) {
+	value, diags := d.GetRawConfigAt(cty.GetAttrPath("pin_wo"))
+	if diags.HasError() {
+		return "", diags
+	}
+	if !value.Type().Equals(cty.String) || value.IsNull() || !value.IsKnown() {
+		return "", nil
+	}
+	return value.AsString(), nil
 }
