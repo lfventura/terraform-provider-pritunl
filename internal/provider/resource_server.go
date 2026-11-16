@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -487,7 +488,7 @@ func resourceServer() *schema.Resource {
 				Required:     false,
 				Optional:     true,
 				Computed:     true,
-				Description:  "The status of the server",
+				Description:  "The status of the server: `online` or `offline`. With `online`, creating the server, and every update that restarts it, starts the server and waits until Pritunl runs it. While the server reads `pending` (its DH parameters are still being generated) no start is sent, since Pritunl ignores it and may lose a pooled DH parameter set to it: the provider waits up to its `server_dh_timeout`, and when the server still reads `pending` then, the apply fails with an error that names the server, and a server being created is tainted so that the next apply replaces it. Once the server reads `offline` it is started, within the provider's `server_start_timeout` (a server that already reads `online` is not started again, and counts as running once it has been online for 40 seconds); a start that fails and a server that stops again are started again. The server then has to read `online` either right after a start Pritunl answered with success or, once a start request got no answer, for longer than the 40 seconds Pritunl may take to give up a start (4 seconds plus its default `vpn.op_timeout` of 25 seconds; the API does not expose that setting, so on an instance where it was raised above 35 seconds a start whose answer was lost can still be reverted after the provider took it as done). When that window closes with the server not running, the apply fails with an error that names the server. A server Pritunl reports as `pending` reads `offline`.",
 				RequiredWith: []string{"organization_ids"},
 				ValidateDiagFunc: func(v interface{}, path cty.Path) diag.Diagnostics {
 					allowedStatusesMap := map[string]struct{}{
@@ -808,9 +809,9 @@ func resourceCreateServer(ctx context.Context, d *schema.ResourceData, meta inte
 	}
 
 	if d.Get("status").(string) == pritunl.ServerStatusOnline {
-		err = apiClient.StartServer(d.Id())
+		err = pritunl.StartServerOnline(ctx, apiClient, d.Id(), serverStartTimeout(meta), serverDhTimeout(meta))
 		if err != nil {
-			return diag.Errorf("Error on starting server: %s", err)
+			return serverStartDiag(err, true)
 		}
 	}
 
@@ -1125,9 +1126,9 @@ func resourceUpdateServer(ctx context.Context, d *schema.ResourceData, meta inte
 	}
 
 	if shouldServerBeStarted {
-		err = apiClient.StartServer(d.Id())
+		err = pritunl.StartServerOnline(ctx, apiClient, d.Id(), serverStartTimeout(meta), serverDhTimeout(meta))
 		if err != nil {
-			return diag.Errorf("Error on starting server: %s", err)
+			return serverStartDiag(err, false)
 		}
 	}
 
@@ -1369,4 +1370,26 @@ func matchStringEntitiesWithSchema(entities []string, declaredEntities []interfa
 	}
 
 	return result
+}
+
+// serverStartDiag is the error of a server the provider could not start. A
+// server that never got its DH parameters is told apart: on create the
+// resource is already in the state, so Terraform taints it and the next apply
+// replaces it; on update the server is kept.
+func serverStartDiag(err error, creating bool) diag.Diagnostics {
+	var dhErr *pritunl.ServerDhPendingError
+	if !errors.As(err, &dhErr) {
+		return diag.Errorf("Error on starting server: %s", err)
+	}
+
+	next := "apply again once Pritunl reports it offline, or replace it with terraform apply -replace"
+	if creating {
+		next = "the resource is tainted and the next apply replaces it"
+	}
+
+	return diag.Diagnostics{{
+		Severity: diag.Error,
+		Summary:  "Error on starting server: DH parameters never generated",
+		Detail:   fmt.Sprintf("%s; %s. The window is the provider setting server_dh_timeout.", err, next),
+	}}
 }

@@ -1,6 +1,7 @@
 package pritunl
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/md5"
 	"crypto/sha256"
@@ -37,6 +38,9 @@ type transport struct {
 // was lost, and replaying it would create a duplicate. The callers that create
 // something retry those themselves after reading the state back (see
 // retryCreate).
+//
+// A request whose context carries withSingleAttempt is sent once and its
+// outcome, transient or not, goes back to the caller, which owns the retry.
 func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Host == "" {
 		u, err := url.Parse(t.baseUrl)
@@ -63,6 +67,9 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		t.sign(req)
 
 		resp, err := t.underlyingTransport.RoundTrip(req)
+		if isSingleAttempt(req.Context()) {
+			return resp, err
+		}
 
 		var retriable bool
 		switch {
@@ -97,6 +104,23 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		case <-time.After(pause.next()):
 		}
 	}
+}
+
+// singleAttemptKey marks the context of a request the transport sends only
+// once.
+type singleAttemptKey struct{}
+
+// withSingleAttempt returns a context whose requests the transport sends once,
+// leaving any retry to the caller. A server start is one: replaying it while
+// the first start is still running in Pritunl gets an immediate 200 that
+// proves nothing (see StartServerOnline).
+func withSingleAttempt(ctx context.Context) context.Context {
+	return context.WithValue(ctx, singleAttemptKey{}, true)
+}
+
+func isSingleAttempt(ctx context.Context) bool {
+	single, _ := ctx.Value(singleAttemptKey{}).(bool)
+	return single
 }
 
 // isDialError reports whether the request never reached the server: the

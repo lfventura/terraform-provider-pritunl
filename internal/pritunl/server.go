@@ -68,6 +68,10 @@ type Server struct {
 	// the request leaves out reaches the backend as false through pritunl-web
 	OvpnDco bool   `json:"ovpn_dco"`
 	Status  string `json:"status,omitempty"`
+	// Uptime is the number of seconds since the running start of the server
+	// began, as Pritunl reports it; zero while the server is not online. It is
+	// read only and never sent.
+	Uptime int `json:"uptime,omitempty"`
 }
 
 func (s *Server) MarshalJSON() ([]byte, error) {
@@ -75,6 +79,9 @@ func (s *Server) MarshalJSON() ([]byte, error) {
 	return json.Marshal(&struct {
 		// Pritunl API expects input mss_fix value as a string, but returns as an int
 		MssFix string `json:"mss_fix"`
+		// uptime is read only: the field shadows the one of the alias and is
+		// always left out
+		Uptime *int `json:"uptime,omitempty"`
 		*Alias
 	}{
 		MssFix: strconv.Itoa(s.MssFix),

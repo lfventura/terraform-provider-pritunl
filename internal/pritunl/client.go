@@ -26,6 +26,7 @@ type Client interface {
 
 	GetServers() ([]Server, error)
 	GetServer(id string) (*Server, error)
+	GetServerContext(ctx context.Context, id string) (*Server, error)
 	CreateServer(serverData map[string]interface{}) (*Server, error)
 	UpdateServer(id string, server *Server) error
 	DeleteServer(id string) error
@@ -48,6 +49,7 @@ type Client interface {
 	DetachHostFromServer(hostId, serverId string) error
 
 	StartServer(serverId string) error
+	StartServerContext(ctx context.Context, serverId string) error
 	StopServer(serverId string) error
 
 	PingWebServer(ctx context.Context) error
@@ -268,8 +270,17 @@ func (c client) DeleteOrganization(id string) error {
 }
 
 func (c client) GetServer(id string) (*Server, error) {
+	return c.GetServerContext(context.Background(), id)
+}
+
+// GetServerContext reads a server; the request, its retries included, ends
+// with ctx.
+func (c client) GetServerContext(ctx context.Context, id string) (*Server, error) {
 	url := fmt.Sprintf("/server/%s", id)
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("GetServer: %w", err)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -694,22 +705,45 @@ func (c client) DetachOrganizationFromServer(organizationId, serverId string) er
 	return nil
 }
 
+// StartServer sends one start of the server; see StartServerContext.
 func (c client) StartServer(serverId string) error {
+	return c.StartServerContext(context.Background(), serverId)
+}
+
+// StartServerContext sends one start of the server, bound to ctx, and returns
+// its outcome without retrying it: the transport does not replay the request,
+// and an answer other than 200 comes back as an *ApiError the caller can
+// classify. Pritunl answers 200 also when it did not start anything (a start
+// already running, DH parameters still being generated), so a 200 alone is no
+// proof the server runs; StartServerOnline is what confirms it.
+func (c client) StartServerContext(ctx context.Context, serverId string) error {
 	url := fmt.Sprintf("/server/%s/operation/start", serverId)
-	req, err := http.NewRequest("PUT", url, nil)
+	req, err := http.NewRequestWithContext(withSingleAttempt(ctx), "PUT", url, nil)
+	if err != nil {
+		return fmt.Errorf("StartServer: %w", err)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("StartServer: Error on HTTP request: %s", err)
+		return fmt.Errorf("StartServer: Error on HTTP request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("Non-200 response on starting the server\nbody=%s", body)
+	// the status line is the answer: a body cut short changes neither a 200
+	// nor a refusal into a start that got no answer
+	body, readErr := io.ReadAll(resp.Body)
+	if resp.StatusCode == 200 {
+		return nil
 	}
 
-	return nil
+	apiError := newApiError("starting the server", resp.StatusCode, body)
+	if readErr != nil && !isGatewayStatus(resp.StatusCode) {
+		// without the whole body an answer of Pritunl cannot be told apart
+		// from a refusal: it is returned as it is, and not retried
+		return fatalError{fmt.Errorf("%w; the body could not be read whole: %s", apiError, readErr)}
+	}
+
+	return apiError
 }
 
 func (c client) StopServer(serverId string) error {
